@@ -3,6 +3,21 @@
 ## Overview
 This repository contains the code for our bachelor thesis at KTH, which focuses on robot planning in a warehouse environment. The project involves setting up a simulated grid environment, implementing an A* algorithm, and implementing a reinforcement learning algorithm. The goal is to compare the efficiency and performance of these two algorithms.
 
+## Table of Contents
+- [Project Structure](#project-structure)
+- [Setup](#setup)
+- [Usage](#usage)
+  - [Running the A* Algorithm](#running-the-a-algorithm)
+  - [Training the Reinforcement Learning Model](#training-the-reinforcement-learning-model)
+  - [Running the Reinforcement Learning Model](#running-the-reinforcement-learning-model)
+  - [Running Tests](#running-tests)
+- [Algorithms](#algorithms)
+  - [A* Algorithm](#a-algorithm)
+  - [Reinforcement Learning Algorithm](#reinforcement-learning-algorithm)
+- [Dependencies](#dependencies)
+- [Contact](#contact)
+- [License](#license)
+
 ## Project Structure
 The project is structured as follows:
 ```
@@ -72,6 +87,15 @@ It is implemented in the [a_star.py](src/algorithms/a_star.py) file.
 The reinforcement learning algorithm is a model-free machine learning algorithm that learns to make decisions by interacting with the environment. The algorithm learns a policy that maps states to actions by maximizing the expected cumulative reward. The algorithm uses a neural network to approximate the Q-function, which estimates the expected cumulative reward of taking an action in a given state.
 
 It is implemented in the [rl.py](src/algorithms/rl.py) file.
+
+## Dependencies
+The project uses the following python dependencies:
+- numpy==2.2.3
+- scipy==1.15.2
+- matplotlib==3.10.1
+- torch==2.6.0
+- pytest==8.3.5
+- gymnasium==1.1.0
 
 ## Contact
 For any questions or feedback, please contact us at
