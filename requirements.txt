@@ -1,0 +1,15 @@
+# Math and data manipulation dependencies
+numpy==2.2.3
+scipy==1.15.2
+
+# Environment dependencies
+gymnasium==1.1.0
+
+# Reinforcement learning dependencies
+torch==2.6.0
+
+# Visualization dependencies
+matplotlib==3.10.1
+
+# Testing dependencies
+pytest==8.3.5
