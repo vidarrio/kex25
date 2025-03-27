@@ -32,7 +32,7 @@ class WarehouseEnv(ParallelEnv):
         self.action_spaces = {agent: spaces.Discrete(7) for agent in self.agents}
 
         # Observation space components
-        # 8 channels: 
+        # 9 channels: 
         # 1. Agent's position (1 at agent's position, 0 elsewhere)
         # 2. Other agents' positions (1 at other agents' positions, 0 elsewhere)
         # 3. Shelves' positions (1 at shelves' positions, 0 elsewhere)
@@ -310,6 +310,55 @@ class WarehouseEnv(ParallelEnv):
                     # Channel 1: Agent position (only at the center)
                     if i == 0 and j == 0:
                         obs[0, lr, lc] = 1
+
+                    # Channel 2: Other agents' positions
+                    cell_has_other_agent = False
+                    for other_agent in self.agents:
+                        if other_agent != agent and self.agent_positions[other_agent] == (gr, gc):
+                            cell_has_other_agent = True
+                            break
+                    obs[1, lr, lc] = 1 if cell_has_other_agent else 0
+
+                    # Channel 3: Static obstacles (shelves)
+                    obs[2, lr, lc] = 1 if self.grid[gr, gc] == 2 else 0
+
+                    # Channel 4: Dynamic obstacles
+                    obs[3, lr, lc] = 1 if self.grid[gr, gc] == 3 else 0
+
+                    # Channel 5: Current goal position
+                    obs[4, lr, lc] = 1 if (gr, gc) == self.agent_goals[agent] else 0
+
+                    # Channel 6: Pickup points
+                    obs[5, lr, lc] = 1 if (gr, gc) in self.pickup_points else 0
+
+                    # Channel 7: Dropoff points
+                    obs[6, lr, lc] = 1 if (gr, gc) in self.delivery_points else 0
+
+        # Channel 8: Agent's carrying status
+        obs[7, :, :] = 1 if self.agent_carrying[agent] else 0
+
+        # Channel 9: Valid pickup/drop indicator
+        if self.agent_carrying[agent]:
+            # If carrying, mark valid dropoff points
+            delivery_idx = self.agent_item_types[agent]
+            for i in range(-window_size, window_size + 1):
+                for j in range(-window_size, window_size + 1):
+                    gr, gc = r + i, c + j
+                    lr, lc = i + window_size, j + window_size
+                    if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
+                        if (gr, gc) == self.delivery_points[delivery_idx]:
+                            obs[8, lr, lc] = 1
+        else:
+            # If not carrying, mark all pickup points as valid
+            for i in range(-window_size, window_size + 1):
+                for j in range(-window_size, window_size + 1):
+                    gr, gc = r + i, c + j
+                    lr, lc = i + window_size, j + window_size
+                    if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
+                        if (gr, gc) in self.pickup_points:
+                            obs[8, lr, lc] = 1
+
+        return obs
 
     def _place_shelves(self):
         """
