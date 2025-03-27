@@ -3,7 +3,7 @@ numpy==2.2.3
 scipy==1.15.2
 
 # Environment dependencies
-gymnasium==1.1.0
+pettingzoo==1.24.3
 
 # Reinforcement learning dependencies
 torch==2.6.0
