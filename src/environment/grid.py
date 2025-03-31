@@ -287,93 +287,280 @@ class WarehouseEnv(ParallelEnv):
         return observations, rewards, terminations, truncations, info
     
     def render(self):
-        """
-        Render the warehouse environment
-        """
-
+        """Render the warehouse environment with support for up to 10 agents"""
         if self.render_mode is None:
-            gymnasium.logger.warn(
-                "Render mode not set. Use 'human' or 'rgb_array'."
-            )
+            gymnasium.logger.warn("Render mode not set. Use 'human' or 'rgb_array'.")
             return
         
-        # Create a grid for visualization
-        vis_grid = np.zeros(self.grid_size)
-
-        # Mark shelves
-        for i in range(self.grid_size[0]):
-            for j in range(self.grid_size[1]):
-                if self.grid[i, j] == 2: # Shelf
-                    vis_grid[i, j] = 2
-
-        # Mark pickup points
-        for pos in self.pickup_points:
-            vis_grid[pos] = 4 # Pickup point
-
-        # Mark dropoff points
-        for pos in self.dropoff_points:
-            vis_grid[pos] = 5 # Dropoff point
-
-        # Mark agents and their goals
-        for i, agent in enumerate(self.agents):
-            # Agent position
-            pos = self.agent_positions[agent]
-            vis_grid[pos] = 5 + i % 5 # Different colors for different agents
-
-            # Agent goal
-            goal = self.agent_goals[agent]
-            if vis_grid[goal] < 5: # Don't overwrite another agent
-                vis_grid[goal] = 10 + i % 5 # Different colors for different agent's goal
-        
-        # Create color map
-        colors = [
-            'white',        # 0: Empty
-            'grey',         # 1: (not used)
-            'black',        # 2: Shelf
-            'blue',         # 3: Dynamic obstacle
-            'green',        # 4: Pickup point
-            'red',          # 5: Dropoff point
-            'orange',       # 6: Agent 1
-            'purple',       # 7: Agent 2
-            'brown',        # 8: Agent 3
-            'pink',         # 9: Agent 4
-            'cyan',         # 10: Agent 1's goal
-            'magenta',      # 11: Agent 2's goal
-            'yellow',       # 12: Agent 3's goal
-            'lime',         # 13: Agent 4's goal
-        ]
-        cmap = ListedColormap(colors)
-
-        plt.figure(figsize=(10, 10))
-        plt.imshow(vis_grid, cmap=cmap)
-        plt.grid(True, color='grey', linestyle='-', linewidth=0.5)
-        plt.title(f"Warehouse Environment - Step {self.steps}")
-
-        # Add legend
-        legend_elements = [
-            plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='black', markersize=10, label='Shelf'),
-            plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='green', markersize=10, label='Pickup Point'),
-            plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='red', markersize=10, label='Dropoff Point'),
-        ]
-
-        for i, agent in enumerate(self.agents[:4]):
-            agent_color = colors[6 + i]
-            goal_color = colors[10 + i]
-            legend_elements.append(plt.Line2D([0], [0], marker='s', color='w', markerfacecolor=agent_color, markersize=10, label=f"Agent {i}"))
-            legend_elements.append(plt.Line2D([0], [0], marker='s', color='w', markerfacecolor=goal_color, markersize=10, label=f"Agent {i}'s Goal"))
-
-        plt.legend(handles=legend_elements, bbox_to_anchor=(1.05, 1), loc='upper left')
-
+        # For human rendering, use a persistent figure
         if self.render_mode == 'human':
-            plt.pause(0.1)
-            plt.show(block=False)
+            # Initialize the figure on first call
+            if not hasattr(self, 'fig') or not plt.fignum_exists(self.fig.number):
+                self.fig, self.ax = plt.figure(figsize=(12, 10), num="Warehouse Environment"), plt.gca()
+            else:
+                # Clear the previous content but keep the figure
+                self.ax.clear()
+            
+            # Draw a white background grid first
+            background = np.zeros(self.grid_size)
+            self.ax.imshow(background, cmap='Greys', alpha=0.1, origin='upper')
+            
+            # Set up the grid
+            self.ax.set_xlim(-0.5, self.grid_size[1] - 0.5)
+            self.ax.set_ylim(-0.5, self.grid_size[0] - 0.5)
+            self.ax.set_xticks(np.arange(-0.5, self.grid_size[1], 1), minor=True)
+            self.ax.set_yticks(np.arange(-0.5, self.grid_size[0], 1), minor=True)
+            self.ax.grid(which='minor', color='grey', linestyle='-', linewidth=0.5)
+            
+            # Remove axis labels and ticks for cleaner look
+            self.ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+            
+            # Draw shelves as black squares
+            shelf_r, shelf_c = [], []
+            for r in range(self.grid_size[0]):
+                for c in range(self.grid_size[1]):
+                    if self.grid[r, c] == 2:  # Shelf
+                        shelf_r.append(r)
+                        shelf_c.append(c)
+            if shelf_r:  # Only draw if there are shelves
+                self.ax.scatter(shelf_c, shelf_r, s=180, marker='s', color='black', label='Shelf')
+            
+            # Draw pickup points as green circles
+            pickup_r, pickup_c = [], []
+            for pos in self.pickup_points:
+                pickup_r.append(pos[0])
+                pickup_c.append(pos[1])
+            if pickup_r:  # Only draw if there are pickup points
+                self.ax.scatter(pickup_c, pickup_r, s=150, marker='o', color='limegreen', label='Pickup Point')
+            
+            # Draw dropoff points as red diamonds
+            dropoff_r, dropoff_c = [], []
+            for pos in self.dropoff_points:
+                dropoff_r.append(pos[0])
+                dropoff_c.append(pos[1])
+            if dropoff_r:  # Only draw if there are dropoff points
+                self.ax.scatter(dropoff_c, dropoff_r, s=150, marker='D', color='tomato', label='Dropoff Point')
+            
+            # Define agent colors - expanded to 10 distinct colors
+            agent_colors = [
+                'darkorange', 'mediumblue', 'purple', 'deeppink', 'teal',
+                'gold', 'darkred', 'forestgreen', 'brown', 'slateblue'
+            ]
+            
+            # Create legend elements for environment components
+            legend_elements = [
+                plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='black', markersize=12, label='Shelf'),
+                plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='limegreen', markersize=12, label='Pickup Point'),
+                plt.Line2D([0], [0], marker='D', color='w', markerfacecolor='tomato', markersize=12, label='Dropoff Point'),
+            ]
+            
+            # Draw agents in two legend columns to save space
+            agent_legend_col1 = []
+            agent_legend_col2 = []
+            
+            # Draw each agent and its goal with the SAME color but DIFFERENT shapes
+            for i, agent in enumerate(self.agents):
+                color_idx = i % len(agent_colors)
+                agent_color = agent_colors[color_idx]
+                pos = self.agent_positions[agent]
+                goal = self.agent_goals[agent]
+                carrying = self.agent_carrying[agent]
+                
+                # Draw agent as a triangle (with black edge for visibility)
+                self.ax.scatter(pos[1], pos[0], s=180, marker='^', 
+                              color=agent_color, 
+                              edgecolors='black', linewidth=1.5)
+                
+                # Draw a circle around agent if carrying
+                if carrying:
+                    self.ax.scatter(pos[1], pos[0], s=280, marker='o', 
+                                   facecolors='none', edgecolors=agent_color, 
+                                   alpha=0.6, linewidth=2)
+                
+                # Draw agent's goal as a star - SAME COLOR but different shape
+                # Only if not already placed as an agent
+                if not any(self.agent_positions[a] == goal for a in self.agents):
+                    self.ax.scatter(goal[1], goal[0], s=180, marker='*', 
+                                  color=agent_color,  # Same color as agent
+                                  edgecolors='black', linewidth=1)
+                
+                # Add agent to legend with carrying status and goal indicator using same color
+                carry_status = "🔄" if carrying else "✓"
+                
+                # Put legend elements into appropriate columns (agents 0-4 in col1, 5-9 in col2)
+                if i < 5:
+                    agent_legend_col1.append(
+                        plt.Line2D([0], [0], marker='^', color='w', 
+                                 markerfacecolor=agent_color,
+                                 markersize=12, 
+                                 label=f"Agent {i} ({carry_status})")
+                    )
+                    
+                    agent_legend_col1.append(
+                        plt.Line2D([0], [0], marker='*', color='w', 
+                                 markerfacecolor=agent_color,  # Same color as agent
+                                 markersize=14, 
+                                 label=f"Agent {i}'s Goal")
+                    )
+                else:
+                    agent_legend_col2.append(
+                        plt.Line2D([0], [0], marker='^', color='w', 
+                                 markerfacecolor=agent_color,
+                                 markersize=12, 
+                                 label=f"Agent {i} ({carry_status})")
+                    )
+                    
+                    agent_legend_col2.append(
+                        plt.Line2D([0], [0], marker='*', color='w', 
+                                 markerfacecolor=agent_color,  # Same color as agent
+                                 markersize=14, 
+                                 label=f"Agent {i}'s Goal")
+                    )
+            
+            # Add status text with agent carrying status in compact form
+            status_rows = []
+            for i in range(0, len(self.agents), 5):  # Group agents in rows of 5
+                status_chunk = []
+                for j in range(5):
+                    if i + j < len(self.agents):
+                        a = self.agents[i + j]
+                        status_chunk.append(f"A{i+j}: {'🔄' if self.agent_carrying[a] else '✓'}")
+                status_rows.append(" | ".join(status_chunk))
+            
+            status_text = "\n".join(status_rows)
+            self.ax.set_title(f"Warehouse Environment - Step {self.steps}\n{status_text}")
+            
+            # Add legends in two columns for better space usage
+            # Environment components and agents 0-4 in first column
+            legend_elements.extend(agent_legend_col1)
+            first_legend = self.ax.legend(handles=legend_elements, 
+                                         bbox_to_anchor=(1.05, 1), 
+                                         loc='upper left', 
+                                         title="Environment & Agents 0-4")
+            
+            # Add second legend for agents 5-9 if they exist
+            if agent_legend_col2:
+                self.ax.add_artist(first_legend)
+                second_legend = self.ax.legend(handles=agent_legend_col2,
+                                             bbox_to_anchor=(1.25, 1),
+                                             loc='upper left',
+                                             title="Agents 5-9")
+            
+            # Add task counter text
+            task_rows = []
+            for i in range(0, len(self.agents), 5):  # Group tasks in rows of 5
+                task_chunk = []
+                for j in range(5):
+                    if i + j < len(self.agents):
+                        a = self.agents[i + j]
+                        task_chunk.append(f"A{i+j}: {self.completed_tasks[a]}")
+                task_rows.append(" | ".join(task_chunk))
+            
+            task_text = "\n".join(task_rows)
+            props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+            self.ax.text(1.05, 0.3, f"Completed Tasks:\n{task_text}", 
+                        transform=self.ax.transAxes, fontsize=9,
+                        verticalalignment='center', bbox=props)
+            
+            # Draw the figure and pause to show it
+            self.fig.tight_layout()
+            self.fig.canvas.draw()
+            plt.pause(0.01)  # Small pause to allow the figure to update
+            return self.fig
+        
+        # For rgb_array rendering mode (similar updates)
         elif self.render_mode == 'rgb_array':
-            fig = plt.gcf()
+            fig, ax = plt.subplots(figsize=(12, 10))
+            
+            # Draw a white background
+            background = np.zeros(self.grid_size)
+            ax.imshow(background, cmap='Greys', alpha=0.1, origin='upper')
+            
+            # Set up the grid
+            ax.set_xlim(-0.5, self.grid_size[1] - 0.5)
+            ax.set_ylim(-0.5, self.grid_size[0] - 0.5)
+            ax.set_xticks(np.arange(-0.5, self.grid_size[1], 1), minor=True)
+            ax.set_yticks(np.arange(-0.5, self.grid_size[0], 1), minor=True)
+            ax.grid(which='minor', color='grey', linestyle='-', linewidth=0.5)
+            ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+            
+            # Draw shelves as black squares
+            shelf_r, shelf_c = [], []
+            for r in range(self.grid_size[0]):
+                for c in range(self.grid_size[1]):
+                    if self.grid[r, c] == 2:  # Shelf
+                        shelf_r.append(r)
+                        shelf_c.append(c)
+            if shelf_r:  # Only draw if there are shelves
+                ax.scatter(shelf_c, shelf_r, s=180, marker='s', color='black', label='Shelf')
+            
+            # Draw pickup points as green circles
+            pickup_r, pickup_c = [], []
+            for pos in self.pickup_points:
+                pickup_r.append(pos[0])
+                pickup_c.append(pos[1])
+            if pickup_r:  # Only draw if there are pickup points
+                ax.scatter(pickup_c, pickup_r, s=150, marker='o', color='limegreen', label='Pickup Point')
+            
+            # Draw dropoff points as red diamonds
+            dropoff_r, dropoff_c = [], []
+            for pos in self.dropoff_points:
+                dropoff_r.append(pos[0])
+                dropoff_c.append(pos[1])
+            if dropoff_r:  # Only draw if there are dropoff points
+                ax.scatter(dropoff_c, dropoff_r, s=150, marker='D', color='tomato', label='Dropoff Point')
+            
+            # Define expanded agent colors
+            agent_colors = [
+                'darkorange', 'mediumblue', 'purple', 'deeppink', 'teal',
+                'gold', 'darkred', 'forestgreen', 'brown', 'slateblue'
+            ]
+            
+            # Draw the agents with the same coloring scheme as human mode
+            for i, agent in enumerate(self.agents):
+                color_idx = i % len(agent_colors)
+                agent_color = agent_colors[color_idx]
+                pos = self.agent_positions[agent]
+                goal = self.agent_goals[agent]
+                carrying = self.agent_carrying[agent]
+                
+                # Draw agent as a triangle
+                ax.scatter(pos[1], pos[0], s=180, marker='^', 
+                          color=agent_color, 
+                          edgecolors='black', linewidth=1.5)
+                
+                # Draw a circle around agent if carrying
+                if carrying:
+                    ax.scatter(pos[1], pos[0], s=280, marker='o', 
+                              facecolors='none', edgecolors=agent_color, 
+                              alpha=0.6, linewidth=2)
+                
+                # Draw agent's goal as a star - SAME COLOR as agent
+                if not any(self.agent_positions[a] == goal for a in self.agents):
+                    ax.scatter(goal[1], goal[0], s=180, marker='*', 
+                              color=agent_color,  # Same color as agent
+                              edgecolors='black', linewidth=1)
+            
+            # Add title with compact status info if needed
+            status_rows = []
+            for i in range(0, len(self.agents), 5):  # Group agents in rows of 5
+                status_chunk = []
+                for j in range(5):
+                    if i + j < len(self.agents):
+                        a = self.agents[i + j]
+                        status_chunk.append(f"A{i+j}: {'🔄' if self.agent_carrying[a] else '✓'}")
+                status_rows.append(" | ".join(status_chunk))
+            
+            status_text = "\n".join(status_rows)
+            ax.set_title(f"Warehouse Environment - Step {self.steps}\n{status_text}")
+            
+            # Convert to RGB array
+            fig.tight_layout()
             fig.canvas.draw()
             img = np.array(fig.canvas.renderer.buffer_rgba())
-            plt.close()
+            plt.close(fig)
             return img
-        
+
     def _get_observation(self, agent):
         """
         Generate observation for an agent
@@ -504,22 +691,92 @@ class WarehouseEnv(ParallelEnv):
 
     def _place_shelves(self):
         """
-        Place shelves in a warehouse-like layout (aisles)
+        Place shelves in a warehouse-like layout with proper aisles
+        - Shelf blocks are 2 wide, 4 long
+        - Vertical aisles are 2 cells wide
+        - Perimeter has 2-cell wide clearance
+        - Shelf count respects self.num_shelves
         """
+        # First clear grid
+        self.grid[:, :] = 0
         
-        # Create horizontal shelves with aisles in between
-        shelf_width = 3
-        aisle_width = 2
+        # Parameters for shelf layout
+        shelf_width = 2       # Width of each shelf block (vertical size)
+        shelf_length = 4      # Length of each shelf block (horizontal size)
+        aisle_width = 2       # Width of vertical aisles between shelf blocks
+        perimeter_width = 2   # Empty space around the perimeter
         
-        for i in range(0, self.grid_size[0], shelf_width + aisle_width):
-            if i + shelf_width >= self.grid_size[0]:
+        # Calculate usable area (excluding perimeter)
+        usable_height = self.grid_size[0] - 2 * perimeter_width
+        usable_width = self.grid_size[1] - 2 * perimeter_width
+        
+        # Calculate spacing
+        h_spacing = shelf_width + aisle_width    # Vertical spacing between shelf blocks
+        w_spacing = shelf_length + aisle_width   # Horizontal spacing between shelf blocks
+        
+        # Calculate maximum number of shelf blocks
+        num_row_blocks = (usable_height + aisle_width) // h_spacing  # +aisle_width because we don't need an aisle after the last row
+        num_col_blocks = (usable_width + aisle_width) // w_spacing   # +aisle_width because we don't need an aisle after the last column
+        
+        # Calculate total number of shelf cells available
+        total_shelf_cells = num_row_blocks * num_col_blocks * shelf_width * shelf_length
+        
+        # Limit by specified number
+        shelf_target = min(self.num_shelves, total_shelf_cells)
+        shelf_cells_placed = 0
+        
+        # Place shelves
+        for row_block in range(num_row_blocks):
+            if shelf_cells_placed >= shelf_target:
                 break
-
-            for j in range(self.grid_size[1]):
-                for k in range(shelf_width):
-                    if j + k < self.grid_size[0]:
-                        self.grid[i + k, j] = 2 # place shelf
+                
+            for col_block in range(num_col_blocks):
+                if shelf_cells_placed >= shelf_target:
+                    break
+                    
+                # Calculate the top-left corner of this shelf block
+                start_row = perimeter_width + row_block * h_spacing
+                start_col = perimeter_width + col_block * w_spacing
+                
+                # Place the shelf cells for this block
+                for i in range(shelf_width):
+                    if start_row + i >= self.grid_size[0]:
+                        continue
+                        
+                    for j in range(shelf_length):
+                        if start_col + j >= self.grid_size[1]:
+                            continue
+                            
+                        if shelf_cells_placed < shelf_target:
+                            self.grid[start_row + i, start_col + j] = 2  # Mark as shelf
+                            shelf_cells_placed += 1
         
+        # Ensure all aisles are clear
+        # Vertical aisles
+        for col_block in range(num_col_blocks + 1):
+            aisle_col = perimeter_width + col_block * w_spacing - aisle_width
+            if col_block > 0:  # Only clear aisles between shelf blocks
+                for r in range(perimeter_width, self.grid_size[0] - perimeter_width):
+                    for c in range(aisle_width):
+                        if 0 <= aisle_col + c < self.grid_size[1]:
+                            self.grid[r, aisle_col + c] = 0  # Clear aisle
+        
+        # Horizontal aisles
+        for row_block in range(num_row_blocks + 1):
+            aisle_row = perimeter_width + row_block * h_spacing - aisle_width
+            if row_block > 0:  # Only clear aisles between shelf blocks
+                for c in range(perimeter_width, self.grid_size[1] - perimeter_width):
+                    for r in range(aisle_width):
+                        if 0 <= aisle_row + r < self.grid_size[0]:
+                            self.grid[aisle_row + r, c] = 0  # Clear aisle
+        
+        # Ensure perimeter is clear
+        for r in range(self.grid_size[0]):
+            for c in range(self.grid_size[1]):
+                if r < perimeter_width or r >= self.grid_size[0] - perimeter_width or \
+                   c < perimeter_width or c >= self.grid_size[1] - perimeter_width:
+                    self.grid[r, c] = 0  # Clear perimeter
+
     def _place_random_points(self, num_points, avoid_values):
         """
         Place random points on the grid, avoiding certain cell types

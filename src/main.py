@@ -4,18 +4,13 @@ from pettingzoo.test import parallel_api_test
 
 def test_warehouse_env():
     # Create warehouse environment with rendering
-    warehouse_env = env(grid_size=(15, 15), n_agents=3, render_mode="human")
+    warehouse_env = env(grid_size=(34, 32), n_agents=10, num_shelves=2048, render_mode="human")
 
     # Reset the environment
     observations = warehouse_env.reset()
 
-    # Test the environment API
-    parallel_api_test(warehouse_env, num_cycles=10)
-
-    return
-
     # Run for some steps
-    for _ in range(100):
+    for _ in range(1000):
         # Random actions
         actions = {
             agent: warehouse_env.action_space(agent).sample()
@@ -23,7 +18,7 @@ def test_warehouse_env():
         }
 
         # Step the environment
-        observations, rewards, dones, infos = warehouse_env.step(actions)
+        observations, rewards, terminations, truncations, infos = warehouse_env.step(actions)
 
         # Render
         warehouse_env.render()
@@ -34,7 +29,7 @@ def test_warehouse_env():
         print(f"Completed tasks: {warehouse_env.completed_tasks}")
 
         # Stop if all agents are done
-        if dones["__all__"]:
+        if terminations["__all__"]:
             break
 
     # Close the environment
