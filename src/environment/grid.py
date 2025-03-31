@@ -1,62 +1,87 @@
 from pettingzoo.utils import wrappers
 from pettingzoo.utils import ParallelEnv
 import numpy as np
+import gymnasium
 from gymnasium import spaces
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 import random
+import functools
 
 class WarehouseEnv(ParallelEnv):
-    metadata = {'render.modes': ['human', 'rgb_array'], 'name': 'warehouse_v0'}
+    metadata = {'render_modes': ['human', 'rgb_array'], 'name': 'warehouse_v0'}
 
-    def __init__(self, grid_size=(20, 20), num_agents=2, num_shelves=30, num_dynamic_obstacles=10, 
-                 num_pickup_points=3, collision_penalty=-2, task_reward=10, step_cost=-0.1, 
+    def __init__(self, grid_size=(20, 20), n_agents=2, num_shelves=30, num_dynamic_obstacles=10, 
+                 num_pickup_points=3, num_dropoff_points=2, collision_penalty=-2, task_reward=10, step_cost=-0.1, 
                  render_mode=None):
         super().__init__()
 
         # Environment parameters
         self.grid_size = grid_size
-        self.num_agents = num_agents
+        self.n_agents = n_agents
         self.num_shelves = num_shelves
         self.num_dynamic_obstacles = num_dynamic_obstacles
         self.num_pickup_points = num_pickup_points
+        self.num_dropoff_points = num_dropoff_points
         self.collision_penalty = collision_penalty
         self.task_reward = task_reward
         self.step_cost = step_cost
         self.render_mode = render_mode
 
-        # Agent definitions
-        self.agents = ["agent_" + str(i) for i in range(num_agents)]
-
-        # Action spaces: 0: Up, 1: Right, 2: Down, 3: Left, 4: Pickup, 5: Drop, 6: Wait
-        self.action_spaces = {agent: spaces.Discrete(7) for agent in self.agents}
-
-        # Observation space components
-        # 9 channels: 
-        # 1. Agent's position (1 at agent's position, 0 elsewhere)
-        # 2. Other agents' positions (1 at other agents' positions, 0 elsewhere)
-        # 3. Shelves' positions (1 at shelves' positions, 0 elsewhere)
-        # 4. Dynamic obstacles' positions (1 at dynamic obstacles' positions, 0 elsewhere)
-        # 5. Current goal position (1 at goal position, 0 elsewhere)
-        # 6. Pickup points' positions (1 at pickup points' positions, 0 elsewhere)
-        # 7. Dropoff points' positions (1 at dropoff points' positions, 0 elsewhere)
-        # 8. Agent's carrying status (1 if agent is carrying, 0 otherwise)
-        # 9. Valid pickup/drop indicator (1 if agent is at a valid pickup/drop point, 0 otherwise)
-
-        # Each agent observes a NxN grid around itself, plus some global state information
-        self.local_observation_size = (5, 5) # 5x5 grid around the agent
-        obs_shape = (9,) + self.local_observation_size
-        self.observation_spaces = {agent: spaces.Boz(low=0, high=1, shape=obs_shape, dtype=np.float32) 
-                                   for agent in self.agents}
+        # Create list of possible agents
+        self.possible_agents = ["agent_" + str(i) for i in range(self.n_agents)]
         
         # Initialize grid and agent data
         self.reset()
+
+    @functools.lru_cache(maxsize=None)
+    def action_space(self, agent):
+        """
+        Return the action space for a specific agent
+        The action space is discrete with the following actions:
+        0: Move Up
+        1: Move Right
+        2: Move Down
+        3: Move Left
+        4: Pickup Item
+        5: Drop Item
+        6: Wait
+        """
+
+        return spaces.Discrete(7)
+
+    @functools.lru_cache(maxsize=None)
+    def observation_space(self, agent):
+        """
+        Return the observation space for a specific agent
+        The observation is a 9-channel grid of size (5, 5) around the agent
+        with the following channels:
+        1. Agent's position (1 at agent's position, 0 elsewhere)
+        2. Other agents' positions (1 at other agents' positions, 0 elsewhere)
+        3. Shelves' positions (1 at shelves' positions, 0 elsewhere)
+        4. Dynamic obstacles' positions (1 at dynamic obstacles' positions, 0 elsewhere)
+        5. Current goal position (1 at goal position, 0 elsewhere)
+        6. Pickup points' positions (1 at pickup points' positions, 0 elsewhere)
+        7. Dropoff points' positions (1 at dropoff points' positions, 0 elsewhere)
+        8. Agent's carrying status (1 if agent is carrying, 0 otherwise)
+        9. Valid pickup/drop indicator (1 if agent is at a valid pickup/drop point, 0 otherwise)
+        """
+
+        local_obs_size = (5, 5) # 5x5 grid around the agent
+        obs_shape = (9,) + local_obs_size
+        return spaces.Box(low=0, high=1, shape=obs_shape, dtype=np.float32)
 
     def reset(self, seed=None, options=None):
         if seed is not None:
             np.random.seed(seed)
             random.seed(seed)
 
+        # Set active agents
+        self.agents = self.possible_agents.copy()
+
+        # Initialize local observation size
+        self.local_observation_size = (5, 5) # 5x5 grid around the agent
+        
         # Initialize grid: 0=empty, 1=agent, 2=shelf, 3=dynamic obstacle, 4=pickup point, 5=dropoff point
         self.grid = np.zeros(self.grid_size, dtype=np.int8)
 
@@ -69,8 +94,8 @@ class WarehouseEnv(ParallelEnv):
             self.grid[pos] = 4
 
         # Place dropoff points (e.g. shipping area)
-        self.delivery_points = self._place_random_points(min(self.num_pickup_points, 3), [1, 2, 4])
-        for pos in self.delivery_points:
+        self.dropoff_points = self._place_random_points(self.num_dropoff_points, [1, 2, 4])
+        for pos in self.dropoff_points:
             self.grid[pos] = 5
 
         # Initialize agents at random positions
@@ -97,12 +122,29 @@ class WarehouseEnv(ParallelEnv):
         # Create observations
         observations = {agent: self._get_observation(agent) for agent in self.agents}
 
-        return observations
+        # Create info dict for additional data
+        info = {agent: {
+            "position": self.agent_positions[agent],
+            "goal": self.agent_goals[agent],
+            "carrying": self.agent_carrying[agent],
+        } for agent in self.agents}
+
+        return observations, info
     
     def step(self, actions):
         self.steps += 1
+
+        # Initialize for active agents
         rewards = {agent: self.step_cost for agent in self.agents} # base cost per step
-        dones = {agent: False for agent in self.agents}
+
+        # Initialize for all possible agents
+        terminations = {agent: False for agent in self.possible_agents}
+        truncations = {agent: False for agent in self.possible_agents}
+
+        # Mark agents not in active list as terminated
+        for agent in self.possible_agents:
+            if agent not in self.agents:
+                terminations[agent] = True
 
         # Process agents in a random order to avoid bias
         agents_order = list(self.agents)
@@ -111,13 +153,13 @@ class WarehouseEnv(ParallelEnv):
         # Track which cells wil be occupied after actions
         new_positions = {}
 
-        # First pass: compute new positions
+        # First pass: compute new positions for movement actions
         for agent in agents_order:
             action = actions[agent]
             current_pos = self.agent_positions[agent]
             new_pos = current_pos
 
-            # Execute action
+            # Execute movement actions (0-3)
             if action < 4: # Movement actions
                 # Compute new position
                 delta_row, delta_col = [(0, -1), (1, 0), (0, 1), (-1, 0)][action]
@@ -131,70 +173,118 @@ class WarehouseEnv(ParallelEnv):
                         new_pos = (new_row, new_col)
                         self.total_distance[agent] += 1
             
-            new_positions[agent] = new_pos
+            # Store new position if it's a movement action (0-3)
+            if action < 4:
+                new_positions[agent] = new_pos
+            else:
+                # For non-movement actions (pickup, dropoff, wait), keep the current position
+                new_positions[agent] = current_pos
 
         # Second pass: check for conflicts and update positions
         for agent in agents_order:
+            action = actions[agent]
             intended_pos = new_positions[agent]
+            current_pos = self.agent_positions[agent]
+            
+            # Handle movement actions (0-3)
+            if action < 4:
+                # Check for collisions with other agents' new positions
+                collision = False
+                for other_agent, other_pos in new_positions.items():
+                    if other_agent != agent:
+                        # Check if agents are trying to move to the same position
+                        if other_pos == intended_pos:
+                            collision = True
+                            break
 
-            # Check for collisions with other agents' new positions
-            collision = False
-            for other_agent, other_pos in new_positions.items():
-                if other_agent != agent and other_pos == intended_pos:
-                    collision = True
-                    break
+                        # Check if agents are trying to swap positions
+                        if (intended_pos == self.agent_positions[other_agent] and other_pos == self.agent_positions[agent]):
+                            collision = True
+                            break
 
-            if collision:
-                # On collision, agent stays in place
-                new_positions[agent] = self.agent_positions[agent]
-                rewards[agent] += self.collision_penalty
-                self.collisions[agent] += 1
-            else:
-                # Update position if no collision
-                self.grid[self.agent_positions[agent]] = 0 # Clear previous position
-                self.agent_positions[agent] = intended_pos
-                self.grid[intended_pos] = 1 # Mark new position
+                if collision:
+                    # On collision, agent stays in place
+                    new_positions[agent] = self.agent_positions[agent]
+                    rewards[agent] += self.collision_penalty
+                    self.collisions[agent] += 1
+                else:
+                    # Update position if no collision
+                    self.grid[self.agent_positions[agent]] = 0 # Clear previous position
+                    self.agent_positions[agent] = intended_pos
+                    self.grid[intended_pos] = 1 # Mark new position
 
-                # Check if agent reached its goal
-                if intended_pos == self.agent_goals[agent]:
-                    if not self.agent_carrying[agent]:
-                        # Agent has reached pickup point
+            # Handle pickup action (4)
+            elif action == 4:
+                # Check if agent is at a pickup point and not carrying an item
+                if current_pos in self.pickup_points and not self.agent_carrying[agent]:
+                    # Check if this pickup point matches the agent's goal
+                    if current_pos == self.agent_goals[agent]:
+                        # Agent can pick up item
                         self.agent_carrying[agent] = True
                         rewards[agent] += self.task_reward / 2 # Reward for picking up an item, half of task reward
 
                         # Remember which item type was picked up
-                        pickup_idx = self.pickup_points.index(intended_pos)
-                        self.agent_item_types[agent] = pickup_idx % len(self.delivery_points)
+                        pickup_idx = self.pickup_points.index(current_pos)
+                        self.agent_item_types[agent] = pickup_idx % len(self.dropoff_points)
 
                         # Assign new goal (dropoff point)
-                        delivery_idx = self.agent_item_types[agent]
-                        self.agent_goals[agent] = self.delivery_points[delivery_idx]
+                        dropoff_idx = self.agent_item_types[agent]
+                        self.agent_goals[agent] = self.dropoff_points[dropoff_idx]
+
                     else:
-                        # Agent has reached dropoff point
+                        # Wrong pickup point, small penalty
+                        rewards[agent] += -0.1
+
+            # Handle dropoff action (5)
+            elif action == 5:
+                # Check if agent is at a dropoff point and carrying an item
+                if current_pos in self.dropoff_points and self.agent_carrying[agent]:
+                    # Check if this dropoff point matches the agent's goal
+                    if current_pos == self.agent_goals[agent]:
+                        # Agent can drop off item
                         self.agent_carrying[agent] = False
                         rewards[agent] += self.task_reward / 2 # Reward for dropping off an item, half of task reward
+
+                        # Increment completed tasks
                         self.completed_tasks[agent] += 1
 
                         # Assign new goal (pickup point)
                         self._assign_new_goal(agent)
+                    else:
+                        # Wrong dropoff point, small penalty
+                        rewards[agent] += -0.1
+
+            # Handle wait action (6)
+            elif action == 6:
+                # No action taken, just wait
+                pass
 
         # Check for termination criteria (e.g. max steps etc.)
         # In a warehouse setting, we might not have a natural termination point
         # so we'll consider the episode ongoing until explicitly stopped
-        dones["__all__"] = False
+        # Terminations are natural endings (e.g. all agents have completed their tasks)
+        # Truncations are artificial endings (e.g. max steps reached)
+        terminations["__all__"] = False
+        truncations["__all__"] = False
 
         # Create observations
         observations = {agent: self._get_observation(agent) for agent in self.agents}
 
         # Optional info dict for additional data
-        info = {agent: {
-            "position:": self.agent_positions[agent],
-            "goal": self.agent_goals[agent],
-            "carrying": self.agent_carrying[agent],
-            "completed_tasks": self.completed_tasks[agent],
-        } for agent in self.agents}
+        info = {}
+        for agent in self.possible_agents:
+            if agent in self.agents:
+                info[agent] = {
+                    "position": self.agent_positions[agent],
+                    "goal": self.agent_goals[agent],
+                    "carrying": self.agent_carrying[agent],
+                    "completed_tasks": self.completed_tasks[agent],
+                }
+            else:
+                # Basic info for inactive agents
+                info[agent] = {"active": False}
 
-        return observations, rewards, dones, info
+        return observations, rewards, terminations, truncations, info
     
     def render(self):
         """
@@ -202,6 +292,9 @@ class WarehouseEnv(ParallelEnv):
         """
 
         if self.render_mode is None:
+            gymnasium.logger.warn(
+                "Render mode not set. Use 'human' or 'rgb_array'."
+            )
             return
         
         # Create a grid for visualization
@@ -218,7 +311,7 @@ class WarehouseEnv(ParallelEnv):
             vis_grid[pos] = 4 # Pickup point
 
         # Mark dropoff points
-        for pos in self.delivery_points:
+        for pos in self.dropoff_points:
             vis_grid[pos] = 5 # Dropoff point
 
         # Mark agents and their goals
@@ -332,7 +425,7 @@ class WarehouseEnv(ParallelEnv):
                     obs[5, lr, lc] = 1 if (gr, gc) in self.pickup_points else 0
 
                     # Channel 7: Dropoff points
-                    obs[6, lr, lc] = 1 if (gr, gc) in self.delivery_points else 0
+                    obs[6, lr, lc] = 1 if (gr, gc) in self.dropoff_points else 0
 
         # Channel 8: Agent's carrying status
         obs[7, :, :] = 1 if self.agent_carrying[agent] else 0
@@ -340,13 +433,13 @@ class WarehouseEnv(ParallelEnv):
         # Channel 9: Valid pickup/drop indicator
         if self.agent_carrying[agent]:
             # If carrying, mark valid dropoff points
-            delivery_idx = self.agent_item_types[agent]
+            dropoff_idx = self.agent_item_types[agent]
             for i in range(-window_size, window_size + 1):
                 for j in range(-window_size, window_size + 1):
                     gr, gc = r + i, c + j
                     lr, lc = i + window_size, j + window_size
                     if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
-                        if (gr, gc) == self.delivery_points[delivery_idx]:
+                        if (gr, gc) == self.dropoff_points[dropoff_idx]:
                             obs[8, lr, lc] = 1
         else:
             # If not carrying, mark all pickup points as valid
@@ -359,6 +452,55 @@ class WarehouseEnv(ParallelEnv):
                             obs[8, lr, lc] = 1
 
         return obs
+    
+    def get_global_state(self):
+        """
+        Get the global state of the environment (for CTDE)
+        """
+
+        # Create a full grid representation with multiple channels
+        global_state = np.zeros((6,) + self.grid_size, dtype=np.float32)
+
+        # Channel 0: All agents' positions (combines 'agent position' and 'other agents' positions')
+        for agent, pos in self.agent_positions.items():
+            global_state[0, pos[0], pos[1]] = 1
+
+        # Channel 1: Shelves (static obstacles)
+        for i in range(self.grid_size[0]):
+            for j in range(self.grid_size[1]):
+                if self.grid[i, j] == 2:
+                    global_state[1, i, j] = 1
+
+        # Channel 2: Dynamic obstacles
+        for i in range(self.grid_size[0]):
+            for j in range(self.grid_size[1]):
+                if self.grid[i, j] == 3:
+                    global_state[2, i, j] = 1
+
+        # Channel 3: Pickup points
+        for pos in self.pickup_points:
+            global_state[3, pos[0], pos[1]] = 1
+
+        # Channel 4: Dropoff points
+        for pos in self.dropoff_points:
+            global_state[4, pos[0], pos[1]] = 1
+
+        # Channel 5: Agent carrying status
+        for agent, carrying in self.agent_carrying.items():
+            if carrying:
+                pos = self.agent_positions[agent]
+                global_state[5, pos[0], pos[1]] = 1
+
+        # Additional info as a dictionary
+        additional_info = {
+            "agent_goals": {agent: goal for agent, goal in self.agent_goals.items()},
+            "agent_carrying": self.agent_carrying,
+            "agent_item_types": self.agent_item_types,
+            "steps": self.steps,
+            "completed_tasks": self.completed_tasks
+        }
+
+        return global_state, additional_info
 
     def _place_shelves(self):
         """
@@ -406,18 +548,18 @@ class WarehouseEnv(ParallelEnv):
 
         if self.agent_carrying[agent]:
             # If agent is carrying an item, deliver it to appropriate dropoff point
-            delivery_idx = self.agent_item_types[agent]
-            self.agent_goals[agent] = self.delivery_points[delivery_idx]
+            dropoff_idx = self.agent_item_types[agent]
+            self.agent_goals[agent] = self.dropoff_points[dropoff_idx]
         else:
             # If agent is not carrying an item, go to a random pickup point
             pickup_idx = random.randint(0, len(self.pickup_points) - 1)
             self.agent_goals[agent] = self.pickup_points[pickup_idx]
 
 # Wrapper for the environment
-def env(grid_size=(20, 20), num_agents=2, num_shelves=30, num_dynamic_obstacles=10, 
-        num_pickup_points=3, render_mode=None):
-    env = WarehouseEnv(grid_size=grid_size, num_agents=num_agents, num_shelves=num_shelves, 
+def env(grid_size=(20, 20), n_agents=2, num_shelves=30, num_dynamic_obstacles=10, 
+        num_pickup_points=3, num_dropoff_points=2, render_mode=None):
+    env = WarehouseEnv(grid_size=grid_size, n_agents=n_agents, num_shelves=num_shelves, 
                        num_dynamic_obstacles=num_dynamic_obstacles, num_pickup_points=num_pickup_points, 
-                       render_mode=render_mode)
-    env = wrappers.CaptureStdoutWrapper(env)
+                       num_dropoff_points=num_dropoff_points, render_mode=render_mode)
+    # env = wrappers.CaptureStdoutWrapper(env)
     return env

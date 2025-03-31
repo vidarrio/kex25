@@ -71,9 +71,31 @@ To run the reinforcement learning model, run the following command:
 ```
 
 ### Running tests
-To run the tests, run the following command:
+To run all tests:
 ```bash
+pytest src/tests/
+```
 
+To run tests for a specific component:
+```bash
+pytest src/tests/test_<component>.py
+```
+where `<component>` is the name of the component you want to test (e.g., `a_star` or `rl`).
+
+To run a specific test function:
+```bash
+pytest src/tests/test_<component>.py::test_<function>
+```
+where `<function>` is the name of the test function you want to run (e.g., `test_api_compliance` or `test_collision_handling`).
+
+To run tests with verbose output, use the `-v` flag:
+```bash
+pytest -v src/tests/
+```
+
+To run tests with print statements, use the `-s` flag:
+```bash
+pytest -s src/tests/
 ```
 
 ## Algorithms
