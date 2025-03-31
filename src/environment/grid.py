@@ -148,16 +148,14 @@ class WarehouseEnv(ParallelEnv):
 
         # Process agents in a random order to avoid bias
         agents_order = list(self.agents)
-        random.shuffle(agents_order)
+        random.shuffle(agents_order)        
 
-        # Track which cells wil be occupied after actions
+        # First pass: compute new positions
         new_positions = {}
-
-        # First pass: compute new positions for movement actions
         for agent in agents_order:
             action = actions[agent]
             current_pos = self.agent_positions[agent]
-            new_pos = current_pos
+            new_pos = current_pos # Default: stay in place
 
             # Execute movement actions (0-3)
             if action < 4: # Movement actions
@@ -166,55 +164,109 @@ class WarehouseEnv(ParallelEnv):
                 new_row = current_pos[0] + delta_row
                 new_col = current_pos[1] + delta_col
 
-                # Check boundaries
-                if 0 <= new_row < self.grid_size[0] and 0 <= new_col < self.grid_size[1]:
-                    # Check for shelf or dynamic obstacle
-                    if self.grid[new_row, new_col] not in [2, 3]:
+                # Check boundaries and obstacles
+                if (0 <= new_row < self.grid_size[0] and 
+                    0 <= new_col < self.grid_size[1] and
+                    self.grid[new_row, new_col] not in [2, 3]): # Not a shelf or dynamic obstacle
                         new_pos = (new_row, new_col)
                         self.total_distance[agent] += 1
             
-            # Store new position if it's a movement action (0-3)
-            if action < 4:
-                new_positions[agent] = new_pos
-            else:
-                # For non-movement actions (pickup, dropoff, wait), keep the current position
-                new_positions[agent] = current_pos
+            # Store intended position
+            new_positions[agent] = new_pos
+        
+        # Second pass: Resolve conflicts
+        final_positions = {}
+        collision_agents = set()
 
-        # Second pass: check for conflicts and update positions
+        # Current positions of all agents
+        current_positions = {agent: self.agent_positions[agent] for agent in self.agents}
+
+        # Track all positions that will be occupied after this step
+        reserved_positions = {}
+
+        # Initial claims on positions
+        for agent in self.agents:
+            pos = current_positions[agent]
+            if pos not in reserved_positions:
+                reserved_positions[pos] = agent
+
         for agent in agents_order:
             action = actions[agent]
             intended_pos = new_positions[agent]
             current_pos = self.agent_positions[agent]
-            
-            # Handle movement actions (0-3)
-            if action < 4:
-                # Check for collisions with other agents' new positions
-                collision = False
-                for other_agent, other_pos in new_positions.items():
-                    if other_agent != agent:
-                        # Check if agents are trying to move to the same position
-                        if other_pos == intended_pos:
-                            collision = True
-                            break
 
-                        # Check if agents are trying to swap positions
-                        if (intended_pos == self.agent_positions[other_agent] and other_pos == self.agent_positions[agent]):
-                            collision = True
-                            break
-
-                if collision:
-                    # On collision, agent stays in place
-                    new_positions[agent] = self.agent_positions[agent]
-                    rewards[agent] += self.collision_penalty
-                    self.collisions[agent] += 1
+            # For non-movement actions (4-6), keep current position
+            if action >= 4: 
+                # Check if current position is already reserved by another agent
+                if current_pos in reserved_positions and agent != reserved_positions[current_pos]:
+                    # Position already reserved - serious collision!
+                    collision_agents.add(agent)
+                    print(f"WARNING: Agent {agent} performing non-movement action but position {current_pos} already claimed by {reserved_positions[current_pos]}")
                 else:
-                    # Update position if no collision
-                    self.grid[self.agent_positions[agent]] = 0 # Clear previous position
-                    self.agent_positions[agent] = intended_pos
-                    self.grid[intended_pos] = 1 # Mark new position
+                    # Position not reserved, or reserved by this agent
+                    final_positions[agent] = current_pos
+                    reserved_positions[current_pos] = agent
+                continue
+
+
+            # For movement actions (0-3), check if intended position is already reserved
+            if intended_pos in reserved_positions:
+                collision_agents.add(agent)
+                
+                # Check if current position is still available
+                if current_pos in reserved_positions and reserved_positions[current_pos] != agent:
+                    # Current position is reserved by another agent
+                    print(f"WARNING: Agent {agent} can't move to {intended_pos} as it's reserved by {reserved_positions[intended_pos]}")
+                    print(f"and can't stay at {current_pos} as it's reserved by {reserved_positions[current_pos]}")
+                
+                else:
+                    # Current position is available, so stay there
+                    final_positions[agent] = current_pos # Stay in place
+                    reserved_positions[current_pos] = agent
+                continue
+
+            # Check for swapping positions
+            swap_collision = False
+            for other_agent in self.agents:
+                if (other_agent != agent and 
+                    current_positions[other_agent] == intended_pos and
+                    new_positions.get(other_agent) == current_pos):
+                    swap_collision = True
+                    break
+
+            if swap_collision:
+                final_positions[agent] = current_pos # Stay in place
+                collision_agents.add(agent)
+                reserved_positions[current_pos] = agent
+            else:
+                final_positions[agent] = intended_pos # Move
+                reserved_positions[intended_pos] = agent
+
+        # Third pass: Update all positions
+        for agent in self.agents:
+            current_pos = self.agent_positions[agent]
+            new_pos = final_positions[agent]
+
+            if current_pos != new_pos:
+                # Clear old position in grid
+                self.grid[current_pos] = 0
+                # Update agent position
+                self.agent_positions[agent] = new_pos
+                # Mark new position in grid
+                self.grid[new_pos] = 1
+
+            # Apply collision penalties
+            if agent in collision_agents:
+                rewards[agent] += self.collision_penalty
+                self.collisions[agent] += 1
+
+        # Fourth pass: Handle pickup/dropoff/wait actions
+        for agent in self.agents:
+            action = actions[agent]
+            current_pos = self.agent_positions[agent]
 
             # Handle pickup action (4)
-            elif action == 4:
+            if action == 4:
                 # Check if agent is at a pickup point and not carrying an item
                 if current_pos in self.pickup_points and not self.agent_carrying[agent]:
                     # Check if this pickup point matches the agent's goal
@@ -235,6 +287,8 @@ class WarehouseEnv(ParallelEnv):
                         # Wrong pickup point, small penalty
                         rewards[agent] += -0.1
 
+                pass
+            
             # Handle dropoff action (5)
             elif action == 5:
                 # Check if agent is at a dropoff point and carrying an item
@@ -253,6 +307,8 @@ class WarehouseEnv(ParallelEnv):
                     else:
                         # Wrong dropoff point, small penalty
                         rewards[agent] += -0.1
+
+                pass
 
             # Handle wait action (6)
             elif action == 6:
@@ -281,8 +337,20 @@ class WarehouseEnv(ParallelEnv):
                     "completed_tasks": self.completed_tasks[agent],
                 }
             else:
-                # Basic info for inactive agents
+                # Basic info for inactive agents§
                 info[agent] = {"active": False}
+
+        # Add at the end of your step method
+        # Verify no agents are sharing positions
+        position_count = {}
+        for agent, pos in self.agent_positions.items():
+            if pos not in position_count:
+                position_count[pos] = []
+            position_count[pos].append(agent)
+
+        for pos, agents in position_count.items():
+            if len(agents) > 1:
+                print(f"WARNING: Position {pos} is shared by agents: {agents}")
 
         return observations, rewards, terminations, truncations, info
     
