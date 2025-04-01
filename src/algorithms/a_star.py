@@ -2,6 +2,7 @@ import heapq
 import numpy as np
 import time
 
+from .human_planner import SimpleHumanPlanner
 DEBUG_NONE = 0
 DEBUG_CRITICAL = 1
 DEBUG_INFO = 2
@@ -456,11 +457,12 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
         n_steps: Number of steps to run
         debug_level: Debug level (default: INFO)
     """
+    human_planner = SimpleHumanPlanner(env)
     # Initialize the A* agent
     a_star_agent = AStarAgent(env)
 
     # Reset the environment
-    observations, _ = env.reset()
+    observations, _, _, _ = env.reset()
 
     # Initial planning for all agents
     a_star_agent.debug(DEBUG_CRITICAL, "\nInitial planning...")
@@ -470,9 +472,10 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
     for step in range(n_steps):
         # Get actions from A* agent
         actions = a_star_agent.get_actions()
+        human_actions = human_planner.get_actions()
         
         # Step the environment
-        observations, rewards, terminations, truncations, infos = env.step(actions)
+        observations, rewards, terminations, truncations, infos, human_observations, human_info = env.step(actions, human_actions)
 
         # Check if any pickup/dropoff actions were performed
         if a_star_agent.handle_post_action_state(actions):

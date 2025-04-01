@@ -11,7 +11,7 @@ import functools
 class WarehouseEnv(ParallelEnv):
     metadata = {'render_modes': ['human', 'rgb_array'], 'name': 'warehouse_v0'}
 
-    def __init__(self, grid_size=(20, 20), n_agents=2, num_shelves=30, num_dynamic_obstacles=10, 
+    def __init__(self, grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, num_dynamic_obstacles=10, 
                  num_pickup_points=3, num_dropoff_points=2, collision_penalty=-2, task_reward=10, step_cost=-0.1, 
                  render_mode=None):
         super().__init__()
@@ -19,6 +19,7 @@ class WarehouseEnv(ParallelEnv):
         # Environment parameters
         self.grid_size = grid_size
         self.n_agents = n_agents
+        self.n_humans = n_humans
         self.num_shelves = num_shelves
         self.num_dynamic_obstacles = num_dynamic_obstacles
         self.num_pickup_points = num_pickup_points
@@ -30,6 +31,9 @@ class WarehouseEnv(ParallelEnv):
 
         # Create list of possible agents
         self.possible_agents = ["agent_" + str(i) for i in range(self.n_agents)]
+        
+        # Create list of possible humans
+        self.possible_humans = ["human_" + str(i) for i in range(self.n_humans)]
         
         # Initialize grid and agent data
         self.reset()
@@ -78,6 +82,9 @@ class WarehouseEnv(ParallelEnv):
 
         # Set active agents
         self.agents = self.possible_agents.copy()
+        
+        # Set active humans
+        self.humans = self.possible_humans.copy()
 
         # Initialize local observation size
         self.local_observation_size = (5, 5) # 5x5 grid around the agent
@@ -108,16 +115,36 @@ class WarehouseEnv(ParallelEnv):
             # Find empty position
             pos = self._get_random_empty_position()
             self.agent_positions[agent] = pos
-            self.grid[pos] = 1
+            self.grid[pos] = 4
 
             # Assign initial goal (pickup point)
             self._assign_new_goal(agent)
+            
+         # Initialize humans at random positions
+        self.human_positions = {}
+        self.human_carrying = {human: False for human in self.humans} # Possible to have humans carry a package
+        self.human_goals = {}
+        self.human_item_types = {} # What type of item the human is carrying (possible extension)
 
+        for human in self.humans:
+            # Find empty position
+            pos = self._get_random_empty_position()
+            self.human_positions[human] = pos
+            self.grid[pos] = 1
+
+            # Assign initial goal (pickup point)
+            self._assign_new_human_goal(human)
+            
         # Metrics tracking
         self.steps = 0
         self.completed_tasks = {agent: 0 for agent in self.agents}
         self.collisions = {agent: 0 for agent in self.agents}
         self.total_distance = {agent: 0 for agent in self.agents}
+        
+        # Metrics for the humans
+        self.human_completed_tasks = {human: 0 for human in self.humans}
+        self.human_collisions = {human: 0 for human in self.humans}
+        self.human_total_distance = {human: 0 for human in self.humans}
 
         # Create observations
         observations = {agent: self._get_observation(agent) for agent in self.agents}
@@ -128,10 +155,20 @@ class WarehouseEnv(ParallelEnv):
             "goal": self.agent_goals[agent],
             "carrying": self.agent_carrying[agent],
         } for agent in self.agents}
-
-        return observations, info
     
-    def step(self, actions):
+        # Create human observations
+        human_observations= {human: self._get_human_observation(human) for human in self.humans}
+
+        # Create info dict for additional data
+        human_info = {human: {
+            "position": self.human_positions[human],
+            "goal": self.human_goals[human],
+            "carrying": self.human_carrying[human],
+        } for human in self.humans}
+
+        return observations, info, human_observations, human_info
+    
+    def step(self, actions, human_actions):
         self.steps += 1
 
         # Initialize for active agents
@@ -140,15 +177,26 @@ class WarehouseEnv(ParallelEnv):
         # Initialize for all possible agents
         terminations = {agent: False for agent in self.possible_agents}
         truncations = {agent: False for agent in self.possible_agents}
+        
+        # Initialize for all possible humans
+        human_terminations = {human: False for human in self.possible_humans}
+        human_truncations = {human: False for human in self.possible_humans}
 
         # Mark agents not in active list as terminated
         for agent in self.possible_agents:
             if agent not in self.agents:
                 terminations[agent] = True
+                
+        # Mark humans not in active list as terminated
+        for human in self.possible_humans:
+            if human not in self.humans:
+                human_terminations[human] = True
 
-        # Process agents in a random order to avoid bias
+        # Process agents and humans in a random order to avoid bias
         agents_order = list(self.agents)
-        random.shuffle(agents_order)        
+        humans_order = list(self.humans)
+        random.shuffle(agents_order)
+        random.shuffle(humans_order)       
 
         # First pass: compute new positions
         new_positions = {}
@@ -174,74 +222,61 @@ class WarehouseEnv(ParallelEnv):
             # Store intended position
             new_positions[agent] = new_pos
         
+        # First pass: compute new positions for humans
+        humans_new_positions = {}
+        for human in humans_order:
+            human_action = human_actions[human]
+            current_pos = self.human_positions[human]
+            new_pos = current_pos # Default: stay in place
+
+            # Execute movement actions (0-3)
+            if human_action < 4: # Movement actions
+                # Compute new position
+                delta_row, delta_col = [(0, -1), (1, 0), (0, 1), (-1, 0)][human_action]
+                new_row = current_pos[0] + delta_row
+                new_col = current_pos[1] + delta_col
+
+                # Check boundaries and obstacles
+                if (0 <= new_row < self.grid_size[0] and 
+                    0 <= new_col < self.grid_size[1] and
+                    self.grid[new_row, new_col] not in [2, 3]): # Not a shelf or dynamic obstacle
+                        new_pos = (new_row, new_col)
+                        # self.total_distance[human] += 1
+            
+            # Store intended position
+            humans_new_positions[human] = new_pos
+        
         # Second pass: Resolve conflicts
-        final_positions = {}
-        collision_agents = set()
-
-        # Current positions of all agents
+    
+        # Current positions of all agents and humans
         current_positions = {agent: self.agent_positions[agent] for agent in self.agents}
+        human_current_positions = {human: self.human_positions[human] for human in self.humans}
 
-        # Track all positions that will be occupied after this step
         reserved_positions = {}
+        # Resolve human conflicts
+        final_human_positions, human_collisions, reserved_positions = second_pass(
+            humans_order,
+            human_current_positions,
+            humans_new_positions,
+            human_actions,
+            self.humans,
+            reserved_positions,
+            allow_overlap=True
+        )
 
-        # Initial claims on positions
-        for agent in self.agents:
-            pos = current_positions[agent]
-            if pos not in reserved_positions:
-                reserved_positions[pos] = agent
+        # resolve agent conflicts
+        final_positions, collision_agents, reserved_positions = second_pass(
+            agents_order, 
+            current_positions, 
+            new_positions, 
+            actions, 
+            self.agents,
+            reserved_positions,
+            allow_overlap=False
+        )
 
-        for agent in agents_order:
-            action = actions[agent]
-            intended_pos = new_positions[agent]
-            current_pos = self.agent_positions[agent]
-
-            # For non-movement actions (4-6), keep current position
-            if action >= 4: 
-                # Check if current position is already reserved by another agent
-                if current_pos in reserved_positions and agent != reserved_positions[current_pos]:
-                    # Position already reserved - serious collision!
-                    collision_agents.add(agent)
-                    print(f"WARNING: Agent {agent} performing non-movement action but position {current_pos} already claimed by {reserved_positions[current_pos]}")
-                else:
-                    # Position not reserved, or reserved by this agent
-                    final_positions[agent] = current_pos
-                    reserved_positions[current_pos] = agent
-                continue
-
-
-            # For movement actions (0-3), check if intended position is already reserved
-            if intended_pos in reserved_positions:
-                collision_agents.add(agent)
-                
-                # Check if current position is still available
-                if current_pos in reserved_positions and reserved_positions[current_pos] != agent:
-                    # Current position is reserved by another agent
-                    print(f"WARNING: Agent {agent} can't move to {intended_pos} as it's reserved by {reserved_positions[intended_pos]}")
-                    print(f"and can't stay at {current_pos} as it's reserved by {reserved_positions[current_pos]}")
-                
-                else:
-                    # Current position is available, so stay there
-                    final_positions[agent] = current_pos # Stay in place
-                    reserved_positions[current_pos] = agent
-                continue
-
-            # Check for swapping positions
-            swap_collision = False
-            for other_agent in self.agents:
-                if (other_agent != agent and 
-                    current_positions[other_agent] == intended_pos and
-                    new_positions.get(other_agent) == current_pos):
-                    swap_collision = True
-                    break
-
-            if swap_collision:
-                final_positions[agent] = current_pos # Stay in place
-                collision_agents.add(agent)
-                reserved_positions[current_pos] = agent
-            else:
-                final_positions[agent] = intended_pos # Move
-                reserved_positions[intended_pos] = agent
-
+        
+        
         # Third pass: Update all positions
         for agent in self.agents:
             current_pos = self.agent_positions[agent]
@@ -259,61 +294,30 @@ class WarehouseEnv(ParallelEnv):
             if agent in collision_agents:
                 rewards[agent] += self.collision_penalty
                 self.collisions[agent] += 1
+                
+        # Third pass: Update all positions (Humans)
+        for human in self.humans:
+            current_pos = self.human_positions[human]
+            new_pos = final_human_positions[human]
+
+            if current_pos != new_pos:
+                # Clear old position in grid
+                self.grid[current_pos] = 0
+                # Update human position
+                self.human_positions[human] = new_pos
+                # Mark new position in grid
+                self.grid[new_pos] = 1
 
         # Fourth pass: Handle pickup/dropoff/wait actions
         for agent in self.agents:
             action = actions[agent]
             current_pos = self.agent_positions[agent]
-
-            # Handle pickup action (4)
-            if action == 4:
-                # Check if agent is at a pickup point and not carrying an item
-                if current_pos in self.pickup_points and not self.agent_carrying[agent]:
-                    # Check if this pickup point matches the agent's goal
-                    if current_pos == self.agent_goals[agent]:
-                        # Agent can pick up item
-                        self.agent_carrying[agent] = True
-                        rewards[agent] += self.task_reward / 2 # Reward for picking up an item, half of task reward
-
-                        # Remember which item type was picked up
-                        pickup_idx = self.pickup_points.index(current_pos)
-                        self.agent_item_types[agent] = pickup_idx % len(self.dropoff_points)
-
-                        # Assign new goal (dropoff point)
-                        dropoff_idx = self.agent_item_types[agent]
-                        self.agent_goals[agent] = self.dropoff_points[dropoff_idx]
-
-                    else:
-                        # Wrong pickup point, small penalty
-                        rewards[agent] += -0.1
-
-                pass
+            self._fourth_pass(agent, action, current_pos, rewards)
             
-            # Handle dropoff action (5)
-            elif action == 5:
-                # Check if agent is at a dropoff point and carrying an item
-                if current_pos in self.dropoff_points and self.agent_carrying[agent]:
-                    # Check if this dropoff point matches the agent's goal
-                    if current_pos == self.agent_goals[agent]:
-                        # Agent can drop off item
-                        self.agent_carrying[agent] = False
-                        rewards[agent] += self.task_reward / 2 # Reward for dropping off an item, half of task reward
-
-                        # Increment completed tasks
-                        self.completed_tasks[agent] += 1
-
-                        # Assign new goal (pickup point)
-                        self._assign_new_goal(agent)
-                    else:
-                        # Wrong dropoff point, small penalty
-                        rewards[agent] += -0.1
-
-                pass
-
-            # Handle wait action (6)
-            elif action == 6:
-                # No action taken, just wait
-                pass
+        for human in self.humans:
+            human_action = human_actions[human]
+            current_pos = self.human_positions[human]
+            self._fourth_pass(human, human_action, current_pos, rewards)
 
         # Check for termination criteria (e.g. max steps etc.)
         # In a warehouse setting, we might not have a natural termination point
@@ -325,6 +329,7 @@ class WarehouseEnv(ParallelEnv):
 
         # Create observations
         observations = {agent: self._get_observation(agent) for agent in self.agents}
+        human_observations = {human: self._get_human_observation(human) for human in self.humans}
 
         # Optional info dict for additional data
         info = {}
@@ -339,6 +344,19 @@ class WarehouseEnv(ParallelEnv):
             else:
                 # Basic info for inactive agents§
                 info[agent] = {"active": False}
+        
+        human_info = {}
+        for human in self.possible_humans:
+            if human in self.humans:
+                info[human] = {
+                    "position": self.human_positions[human],
+                    "goal": self.human_goals[human],
+                    "carrying": self.human_carrying[human],
+                    "completed_tasks": self.human_completed_tasks[human],
+                }
+            else:
+                # Basic info for inactive humans§
+                human_info[human] = {"active": False}
 
         # Add at the end of your step method
         # Verify no agents are sharing positions
@@ -351,8 +369,8 @@ class WarehouseEnv(ParallelEnv):
         for pos, agents in position_count.items():
             if len(agents) > 1:
                 print(f"WARNING: Position {pos} is shared by agents: {agents}")
-
-        return observations, rewards, terminations, truncations, info
+        
+        return observations, rewards, terminations, truncations, info, human_observations, human_info
     
     def render(self):
         """Render the warehouse environment with support for up to 10 agents"""
@@ -483,6 +501,70 @@ class WarehouseEnv(ParallelEnv):
                                  markerfacecolor=agent_color,  # Same color as agent
                                  markersize=14, 
                                  label=f"Agent {i}'s Goal")
+                    )
+                    
+                    
+            # Draw agents in two legend columns to save space
+            human_legend_col1 = []
+            human_legend_col2 = []
+            
+            # Draw each human and its goal with the SAME color but DIFFERENT shapes
+            for i, human in enumerate(self.humans):
+                # color_idx = "black"
+                human_color = "black"
+                pos = self.human_positions[human]
+                goal = self.human_goals[human]
+                carrying = self.human_carrying[human]
+                
+                # Draw human as a triangle (with black edge for visibility)
+                self.ax.scatter(pos[1], pos[0], s=180, marker='^', 
+                              color=human_color, 
+                              edgecolors='black', linewidth=1.5)
+                
+                # Draw a circle around human if carrying
+                if carrying:
+                    self.ax.scatter(pos[1], pos[0], s=280, marker='o', 
+                                   facecolors='none', edgecolors=human_color, 
+                                   alpha=0.6, linewidth=2)
+                
+                # Draw human's goal as a star - SAME COLOR but different shape
+                # Only if not already placed as an human
+                if not any(self.human_positions[a] == goal for a in self.humans):
+                    self.ax.scatter(goal[1], goal[0], s=180, marker='*', 
+                                  color=human_color,  # Same color as human
+                                  edgecolors='black', linewidth=1)
+                
+                # Add human to legend with carrying status and goal indicator using same color
+                carry_status = "🔄" if carrying else "✓"
+                
+                # Put legend elements into appropriate columns (humans 0-4 in col1, 5-9 in col2)
+                if i < 5:
+                    human_legend_col1.append(
+                        plt.Line2D([0], [0], marker='^', color='w', 
+                                 markerfacecolor=human_color,
+                                 markersize=12, 
+                                 label=f"Human {i} ({carry_status})")
+                    )
+                    
+                    human_legend_col1.append(
+                        plt.Line2D([0], [0], marker='*', color='w', 
+                                 markerfacecolor=human_color,  # Same color as human
+                                 markersize=14, 
+                                 label=f"Human {i}'s Goal")
+                    )
+                else:
+                    human_legend_col2.append(
+                        plt.Line2D([0], [0], marker='^', color='w', 
+                                 markerfacecolor=human_color,
+                                 markersize=12, 
+                                 label=f"Human {i} ({carry_status})")
+                    )
+                    
+                    human_legend_col2.append(
+                        plt.Line2D([0], [0], marker='*', color='w', 
+                                 markerfacecolor=human_color,  # Same color as human
+                                 markersize=14, 
+                                 label=f"Human {i}'s Goal")
                     )
             
             # Add status text with agent carrying status in compact form
@@ -708,6 +790,85 @@ class WarehouseEnv(ParallelEnv):
 
         return obs
     
+    def _get_human_observation(self, human):
+        """
+        Generate observation for an human
+        """
+
+        # Get human's position
+        human_pos = self.human_positions[human]
+
+        # Initialize observation channels
+        obs = np.zeros((9,) + self.local_observation_size, dtype=np.float32)
+
+        # Extract the local observation window (5x5 grid around the human)
+        r, c = human_pos
+        window_size = self.local_observation_size[0] // 2
+
+        # For each cell in the observation window
+        for i in range(-window_size, window_size + 1):
+            for j in range(-window_size, window_size + 1):
+                # Calculate global grid coordinates
+                gr, gc = r + i, c + j
+
+                # Calculate local observation coordinates
+                lr, lc = i + window_size, j + window_size
+
+                # Check if the global coordinates are within bounds
+                if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
+                    # Channel 1: human position (only at the center)
+                    if i == 0 and j == 0:
+                        obs[0, lr, lc] = 1
+
+                    # Channel 2: Other humans' positions
+                    cell_has_other_human = False
+                    for other_human in self.humans:
+                        if other_human != human and self.human_positions[other_human] == (gr, gc):
+                            cell_has_other_human = True
+                            break
+                    obs[1, lr, lc] = 1 if cell_has_other_human else 0
+
+                    # Channel 3: Static obstacles (shelves)
+                    obs[2, lr, lc] = 1 if self.grid[gr, gc] == 2 else 0
+
+                    # Channel 4: Dynamic obstacles
+                    obs[3, lr, lc] = 1 if self.grid[gr, gc] == 3 else 0
+
+                    # Channel 5: Current goal position
+                    obs[4, lr, lc] = 1 if (gr, gc) == self.human_goals[human] else 0
+
+                    # Channel 6: Pickup points
+                    obs[5, lr, lc] = 1 if (gr, gc) in self.pickup_points else 0
+
+                    # Channel 7: Dropoff points
+                    obs[6, lr, lc] = 1 if (gr, gc) in self.dropoff_points else 0
+
+        # Channel 8: human's carrying status
+        obs[7, :, :] = 1 if self.human_carrying[human] else 0
+
+        # Channel 9: Valid pickup/drop indicator
+        if self.human_carrying[human]:
+            # If carrying, mark valid dropoff points
+            dropoff_idx = self.human_item_types[human]
+            for i in range(-window_size, window_size + 1):
+                for j in range(-window_size, window_size + 1):
+                    gr, gc = r + i, c + j
+                    lr, lc = i + window_size, j + window_size
+                    if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
+                        if (gr, gc) == self.dropoff_points[dropoff_idx]:
+                            obs[8, lr, lc] = 1
+        else:
+            # If not carrying, mark all pickup points as valid
+            for i in range(-window_size, window_size + 1):
+                for j in range(-window_size, window_size + 1):
+                    gr, gc = r + i, c + j
+                    lr, lc = i + window_size, j + window_size
+                    if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
+                        if (gr, gc) in self.pickup_points:
+                            obs[8, lr, lc] = 1
+
+        return obs
+    
     def get_global_state(self):
         """
         Get the global state of the environment (for CTDE)
@@ -870,7 +1031,7 @@ class WarehouseEnv(ParallelEnv):
         """
         Assign a new goal to the agent
         """
-
+        
         if self.agent_carrying[agent]:
             # If agent is carrying an item, deliver it to appropriate dropoff point
             dropoff_idx = self.agent_item_types[agent]
@@ -879,11 +1040,137 @@ class WarehouseEnv(ParallelEnv):
             # If agent is not carrying an item, go to a random pickup point
             pickup_idx = random.randint(0, len(self.pickup_points) - 1)
             self.agent_goals[agent] = self.pickup_points[pickup_idx]
+            
+    def _assign_new_human_goal(self, human):
+        """
+        Assign a new random goal to the human.
+        The new goal is selected from an empty cell on the grid, avoiding shelves (2)
+        and dynamic obstacles (3). Humans do not carry anything, so we ignore pickup/dropoff points.
+        """
+        # Allow cells that are not shelves (2) or dynamic obstacles (3)
+        self.human_goals[human] = self._get_random_empty_position(avoid_values=[2, 3])
+
+            
+            
+    def _fourth_pass(self, agent, action, current_pos, rewards):
+
+        # Handle pickup action (4)
+        if action == 4:
+            # Check if agent is at a pickup point and not carrying an item
+            if current_pos in self.pickup_points and not self.agent_carrying[agent]:
+                # Check if this pickup point matches the agent's goal
+                if current_pos == self.agent_goals[agent]:
+                    # Agent can pick up item
+                    self.agent_carrying[agent] = True
+                    rewards[agent] += self.task_reward / 2  # Reward for picking up an item
+
+                    # Remember which item type was picked up
+                    pickup_idx = self.pickup_points.index(current_pos)
+                    self.agent_item_types[agent] = pickup_idx % len(self.dropoff_points)
+
+                    # Assign new goal (dropoff point)
+                    dropoff_idx = self.agent_item_types[agent]
+                    self.agent_goals[agent] = self.dropoff_points[dropoff_idx]
+
+                else:
+                    # Wrong pickup point, small penalty
+                    rewards[agent] += -0.1
+
+        # Handle dropoff action (5)
+        elif action == 5:
+            # Check if agent is at a dropoff point and carrying an item
+            if current_pos in self.dropoff_points and self.agent_carrying[agent]:
+                # Check if this dropoff point matches the agent's goal
+                if current_pos == self.agent_goals[agent]:
+                    # Agent can drop off item
+                    self.agent_carrying[agent] = False
+                    rewards[agent] += self.task_reward / 2  # Reward for dropping off an item
+
+                    # Increment completed tasks
+                    self.completed_tasks[agent] += 1
+
+                    # Assign new goal (pickup point)
+                    self._assign_new_goal(agent)
+                else:
+                    # Wrong dropoff point, small penalty
+                    rewards[agent] += -0.1
+
+        # Handle wait action (6)
+        elif action == 6:
+            # No action taken, just wait
+            pass
+
+def second_pass(entities_order, current_positions, new_positions, actions, all_entities, reserved_positions, allow_overlap=False):
+    final_positions = {}
+    collision_entities = set()
+    
+    # Initial claims on positions:
+    for entity in all_entities:
+        pos = current_positions[entity]
+        if pos not in reserved_positions:
+            reserved_positions[pos] = entity
+
+    for entity in entities_order:
+        action_val = actions[entity]
+        intended_pos = new_positions[entity]
+        current_pos = current_positions[entity]
+        
+        # Non-movement actions (4-6): stay in place.
+        if action_val >= 4:
+            if current_pos in reserved_positions and reserved_positions[current_pos] != entity:
+                collision_entities.add(entity)
+            else:
+                final_positions[entity] = current_pos
+                reserved_positions[current_pos] = entity
+            continue
+        
+        # For movement actions (0-3):
+        if intended_pos in reserved_positions:
+            occupant = reserved_positions[intended_pos]
+            # Allow overlap only if:
+            #   - allow_overlap flag is True,
+            #   - and both entity and occupant are humans.
+            if allow_overlap and entity.startswith("human") and occupant.startswith("human"):
+                final_positions[entity] = intended_pos
+            else:
+                collision_entities.add(entity)
+                # Stay in current position.
+                if current_pos not in reserved_positions or reserved_positions[current_pos] == entity:
+                    final_positions[entity] = current_pos
+                    reserved_positions[current_pos] = entity
+                else:
+                    final_positions[entity] = current_pos
+            continue
+        
+        # Check for swapping positions:
+        swap_collision = any(
+            other_entity != entity and
+            current_positions[other_entity] == intended_pos and
+            new_positions.get(other_entity) == current_pos
+            for other_entity in all_entities
+        )
+        if swap_collision:
+            final_positions[entity] = current_pos
+            collision_entities.add(entity)
+            reserved_positions[current_pos] = entity
+        else:
+            final_positions[entity] = intended_pos
+            reserved_positions[intended_pos] = entity
+
+    # Ensure every entity has a final position.
+    for entity in all_entities:
+        if entity not in final_positions:
+            final_positions[entity] = current_positions[entity]
+    
+    return final_positions, collision_entities, reserved_positions
+
+    
+
 
 # Wrapper for the environment
-def env(grid_size=(20, 20), n_agents=2, num_shelves=30, num_dynamic_obstacles=10, 
+def env(grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, num_dynamic_obstacles=10, 
         num_pickup_points=3, num_dropoff_points=2, render_mode=None):
-    env = WarehouseEnv(grid_size=grid_size, n_agents=n_agents, num_shelves=num_shelves, 
+    env = WarehouseEnv(grid_size=grid_size, n_agents=n_agents, n_humans=n_humans, num_shelves=num_shelves, 
                        num_dynamic_obstacles=num_dynamic_obstacles, num_pickup_points=num_pickup_points, 
                        num_dropoff_points=num_dropoff_points, render_mode=render_mode)
     # env = wrappers.CaptureStdoutWrapper(env)
