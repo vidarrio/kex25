@@ -13,7 +13,7 @@ from environment import env
 def warehouse_env():
     """Create a test environment"""
     with warnings.catch_warnings():
-        test_env = env(grid_size=(15, 15), n_agents=3, num_shelves=10, num_dynamic_obstacles=2, num_pickup_points=2, num_dropoff_points=2, render_mode=None)
+        test_env = env(grid_size=(15, 15), n_agents=3, num_shelves=10, n_humans=2, num_pickup_points=2, num_dropoff_points=2, render_mode=None)
 
     yield test_env
 
