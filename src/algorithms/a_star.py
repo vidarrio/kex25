@@ -34,10 +34,10 @@ class AStarAgent:
 
         # Action mapping for movement
         self.action_to_delta = {
-            0: (0, -1),  # Up
-            1: (1, 0),   # Right
-            2: (0, 1),   # Down
-            3: (-1, 0),  # Left
+            0: (0, -1),  # LEFT: decrease column
+            1: (1, 0),   # DOWN: increase row
+            2: (0, 1),   # RIGHT: increase column
+            3: (-1, 0),  # UP: decrease row
             4: None,     # Pickup
             5: None,     # Dropoff
             6: None,     # Wait
@@ -45,10 +45,10 @@ class AStarAgent:
 
         # Delta to action mapping 
         self.delta_to_action = {
-            (0, -1): 0,  # Up
-            (1, 0): 1,   # Right
-            (0, 1): 2,   # Down
-            (-1, 0): 3,  # Left
+            (0, -1): 0,  # LEFT
+            (1, 0): 1,   # DOWN
+            (0, 1): 2,   # RIGHT
+            (-1, 0): 3,  # UP
         }
 
     def debug(self, level, message):
@@ -137,8 +137,17 @@ class AStarAgent:
                 # Reserve space-time points for this agent's path
                 time_step = 0
                 for pos_r, pos_c, action in path:
-                    if action < 4:  # Only reserve for movement actions
-                        reservations[(pos_r, pos_c, time_step)] = agent
+                    # Only reserve MOVEMENT and PICKUP/DROPOFF actions (not wait)
+                    # AND limit how far ahead we reserve to prevent deadlocks
+                    max_reservation_horizon = 15
+                    if time_step < max_reservation_horizon:
+                        if action < 6:  # Actions 0-5 (movement, pickup, dropoff)
+                            reservations[(pos_r, pos_c, time_step)] = agent
+                        
+                        # For wait actions, only reserve the NEXT wait position
+                        # This prevents deadlocks while still avoiding immediate collisions
+                        elif action == 6 and time_step == 0:
+                            reservations[(pos_r, pos_c, time_step)] = agent
                     time_step += 1
             else:
                 # If no path found, agent will wait
@@ -471,9 +480,6 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
     for step in range(n_steps):
         # Get actions from A* agent
         actions = a_star_agent.get_actions()
-
-        # Debug
-        a_star_agent.debug(DEBUG_SPECIFIC, f"Step {step} actions: {actions}")
         
         # Step the environment
         observations, rewards, terminations, truncations, infos = env.step(actions)

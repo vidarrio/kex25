@@ -10,6 +10,7 @@ import functools
 import os
 import sys
 from .utils import SimpleHumanPlanner, get_random_empty_position, assign_new_human_goal
+from matplotlib.widgets import Button
 
 class WarehouseEnv(ParallelEnv):
     metadata = {'render_modes': ['human', 'rgb_array'], 'name': 'warehouse_v0'}
@@ -244,7 +245,7 @@ class WarehouseEnv(ParallelEnv):
                 # Update human position
                 self.human_positions[human] = new_pos
                 # Mark new position in grid
-                self.grid[new_pos] = 1
+                self.grid[new_pos] = 3  # Human
 
         # Fourth pass: Handle human pickup/dropoff/wait actions
         for human in self.humans:
@@ -357,18 +358,28 @@ class WarehouseEnv(ParallelEnv):
     
     def render(self):
         """Render the warehouse environment with support for up to 10 agents"""
-        if self.render_mode is None:
-            gymnasium.logger.warn("Render mode not set. Use 'human' or 'rgb_array'.")
-            return
-
-        # For human rendering, use a persistent figure
         if self.render_mode == 'human':
             # Initialize the figure on first call
             if not hasattr(self, 'fig') or not plt.fignum_exists(self.fig.number):
-                self.fig, self.ax = plt.figure(figsize=(12, 10), num="Warehouse Environment"), plt.gca()
+                self.fig = plt.figure(figsize=(12, 10), num="Warehouse Environment")
+                self.ax = plt.subplot(111)
+                
+                # Create a more attractive button instead of a checkbox
+                self.button_ax = plt.axes([0.05, 0.02, 0.15, 0.05])  # [left, bottom, width, height]
+                self.show_goal_lines = True  # Default state
+                self.button_text = "Hide Goal Lines" if self.show_goal_lines else "Show Goal Lines"
+                self.button = Button(
+                    self.button_ax, self.button_text,
+                    color='lightblue', hovercolor='skyblue'
+                )
+                self.button.on_clicked(self._toggle_goal_lines)
+                
+                # Store agent goal lines for toggling visibility
+                self.goal_lines = []
             else:
                 # Clear the previous content but keep the figure
                 self.ax.clear()
+                self.goal_lines = []  # Clear old goal lines references
 
             # Draw a white background grid first
             background = np.zeros(self.grid_size)
@@ -384,6 +395,58 @@ class WarehouseEnv(ParallelEnv):
             # Remove axis labels and ticks for cleaner look
             self.ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
 
+            # Get figure size to calculate dynamic font and table scaling
+            fig_width, fig_height = self.fig.get_size_inches()
+            scale_factor = min(fig_width/12.0, fig_height/10.0)  # Base scale on original size
+
+            # Define title and info text font sizes that scale with window size
+            title_size = max(14, int(16 * scale_factor))
+            info_size = max(10, int(12 * scale_factor))
+            info_text = f"Step: {self.steps}   |   Agents: {len(self.agents)}   |   Humans: {len(self.humans)}"
+            
+            # Create title with main title and info text
+            title = f"Multi-Agent Warehouse Environment\n\n{info_text}"
+            
+            # Set title with proper padding
+            self.ax.set_title(title, 
+                             fontsize=title_size,
+                             fontweight='bold', 
+                             pad=25)
+            
+            # Position title and adjust styling
+            title_obj = self.ax.title
+            title_obj.set_y(1.05)
+            
+            try:
+                # Split title into separate components for better styling
+                title_text = title_obj.get_text()
+                lines = title_text.split('\n')
+                
+                # Clear existing title
+                self.ax.set_title("")
+                
+                # Add main title at the top
+                self.ax.text(0.5, 1.08, lines[0], 
+                            transform=self.ax.transAxes,
+                            ha='center', va='center', 
+                            fontsize=title_size, 
+                            fontweight='bold')
+                
+                # Add info text with background below title
+                if len(lines) > 2:
+                    self.ax.text(0.5, 1.03, lines[2],
+                                transform=self.ax.transAxes,
+                                ha='center', va='center', 
+                                fontsize=info_size,
+                                fontweight='bold',
+                                bbox=dict(facecolor='lightblue', alpha=0.5, boxstyle='round,pad=0.5'))
+            except Exception:
+                # Fallback if text splitting fails
+                pass
+            
+            # Create space for title and info
+            self.fig.subplots_adjust(top=0.85)
+
             # Draw shelves as black squares
             shelf_r, shelf_c = [], []
             for r in range(self.grid_size[0]):
@@ -391,43 +454,39 @@ class WarehouseEnv(ParallelEnv):
                     if self.grid[r, c] == 2:  # Shelf
                         shelf_r.append(r)
                         shelf_c.append(c)
-            if shelf_r:  # Only draw if there are shelves
+            if shelf_r:
                 self.ax.scatter(shelf_c, shelf_r, s=180, marker='s', color='black', label='Shelf')
 
-            # Draw pickup points as green circles
-            pickup_r, pickup_c = [], []
+            # Draw pickup points as green grid cells
             for pos in self.pickup_points:
-                pickup_r.append(pos[0])
-                pickup_c.append(pos[1])
-            if pickup_r:  # Only draw if there are pickup points
-                self.ax.scatter(pickup_c, pickup_r, s=150, marker='o', color='limegreen', label='Pickup Point')
+                r, c = pos
+                rect = plt.Rectangle((c-0.5, r-0.5), 1, 1, facecolor='limegreen', alpha=0.4, edgecolor='limegreen')
+                self.ax.add_patch(rect)
 
-            # Draw dropoff points as red diamonds
-            dropoff_r, dropoff_c = [], []
+            # Draw dropoff points as red grid cells
             for pos in self.dropoff_points:
-                dropoff_r.append(pos[0])
-                dropoff_c.append(pos[1])
-            if dropoff_r:  # Only draw if there are dropoff points
-                self.ax.scatter(dropoff_c, dropoff_r, s=150, marker='D', color='tomato', label='Dropoff Point')
+                r, c = pos
+                rect = plt.Rectangle((c-0.5, r-0.5), 1, 1, facecolor='tomato', alpha=0.4, edgecolor='tomato')
+                self.ax.add_patch(rect)
 
-            # Define agent colors - expanded to 10 distinct colors
+            # Define distinct colors for up to 10 agents
             agent_colors = [
                 'darkorange', 'mediumblue', 'purple', 'deeppink', 'teal',
-                'gold', 'darkred', 'forestgreen', 'brown', 'slateblue'
+                'darkgoldenrod', 'darkred', 'forestgreen', 'brown', 'slateblue'
             ]
 
             # Create legend elements for environment components
-            legend_elements = [
+            env_legend_elements = [
                 plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='black', markersize=12, label='Shelf'),
-                plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='limegreen', markersize=12, label='Pickup Point'),
-                plt.Line2D([0], [0], marker='D', color='w', markerfacecolor='tomato', markersize=12, label='Dropoff Point'),
+                plt.Rectangle((0, 0), 1, 1, facecolor='limegreen', alpha=0.4, label='Pickup Point'),
+                plt.Rectangle((0, 0), 1, 1, facecolor='tomato', alpha=0.4, label='Dropoff Point'),
+                plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='black', markersize=12, label='Human')
             ]
 
-            # Draw agents in two legend columns to save space
-            agent_legend_col1 = []
-            agent_legend_col2 = []
+            # Prepare agent legend elements
+            agent_legend_elements = []
 
-            # Draw each agent and its goal with the SAME color but DIFFERENT shapes
+            # Draw each agent with its goal
             for i, agent in enumerate(self.agents):
                 color_idx = i % len(agent_colors)
                 agent_color = agent_colors[color_idx]
@@ -435,100 +494,140 @@ class WarehouseEnv(ParallelEnv):
                 goal = self.agent_goals[agent]
                 carrying = self.agent_carrying[agent]
 
-                # Draw agent as a triangle (with black edge for visibility)
-                self.ax.scatter(pos[1], pos[0], s=180, marker='^',
+                # Draw agent as a colored circle with black edge
+                self.ax.scatter(pos[1], pos[0], s=180, marker='o',
                                 color=agent_color,
                                 edgecolors='black', linewidth=1.5)
-
-                # Draw a circle around agent if carrying
+                
+                # Add + or - to indicate carrying status
                 if carrying:
-                    self.ax.scatter(pos[1], pos[0], s=280, marker='o',
-                                    facecolors='none', edgecolors=agent_color,
-                                    alpha=0.6, linewidth=2)
-
-                # Draw agent's goal as a star - SAME COLOR but different shape
-                # Only if not already placed as an agent
-                if not any(self.agent_positions[a] == goal for a in self.agents):
-                    self.ax.scatter(goal[1], goal[0], s=180, marker='*',
-                                    color=agent_color,  # Same color as agent
-                                    edgecolors='black', linewidth=1)
-
-                # Add agent to legend with carrying status and goal indicator using same color
-                carry_status = "🔄" if carrying else "✓"
-
-                # Put legend elements into appropriate columns (agents 0-4 in col1, 5-9 in col2)
-                if i < 5:
-                    agent_legend_col1.append(
-                        plt.Line2D([0], [0], marker='^', color='w',
-                                   markerfacecolor=agent_color,
-                                   markersize=12,
-                                   label=f"Agent {i} ({carry_status})")
-                    )
-
-                    agent_legend_col1.append(
-                        plt.Line2D([0], [0], marker='*', color='w',
-                                   markerfacecolor=agent_color,  # Same color as agent
-                                   markersize=14,
-                                   label=f"Agent {i}'s Goal")
-                    )
+                    self.ax.text(pos[1], pos[0] - 0.02, "+", 
+                                ha='center', va='center', fontsize=14, 
+                                fontweight='bold', color='white')
                 else:
-                    agent_legend_col2.append(
-                        plt.Line2D([0], [0], marker='^', color='w',
-                                   markerfacecolor=agent_color,
-                                   markersize=12,
-                                   label=f"Agent {i} ({carry_status})")
-                    )
+                    self.ax.text(pos[1], pos[0], "-", 
+                                ha='center', va='center', fontsize=16, 
+                                fontweight='bold', color='white')
 
-                    agent_legend_col2.append(
-                        plt.Line2D([0], [0], marker='*', color='w',
-                                   markerfacecolor=agent_color,  # Same color as agent
-                                   markersize=14,
-                                   label=f"Agent {i}'s Goal")
-                    )
+                # Connect agent to goal with a dotted line
+                line = self.ax.plot([pos[1], goal[1]], [pos[0], goal[0]], 
+                            color=agent_color, linestyle='--', linewidth=2.0, alpha=0.8)[0]
+                self.goal_lines.append(line)
+                
+                # Set line visibility based on toggle state
+                line.set_visible(self.show_goal_lines)
+                
+                # Add agent to legend with carrying status
+                carry_status = "+" if carrying else "-"
+                agent_legend_elements.append(
+                    plt.Line2D([0], [0], marker='o', color='w',
+                            markerfacecolor=agent_color,
+                            markersize=12,
+                            label=f"Agent {i} ({carry_status})")
+                )
 
-            # Draw humans as black triangles
+            # Draw humans as black circles
             for human in self.humans:
                 human_color = "black"
                 pos = self.human_positions[human]
-                goal = self.human_goals[human]
-
-                # Draw human as a triangle (with black edge for visibility)
-                self.ax.scatter(pos[1], pos[0], s=180, marker='^',
+                
+                self.ax.scatter(pos[1], pos[0], s=180, marker='o',
                                 color=human_color,
                                 edgecolors='black', linewidth=1.5)
+            
+            # Add environment legend
+            first_legend = self.ax.legend(handles=env_legend_elements,
+                                        bbox_to_anchor=(1.05, 1),
+                                        loc='upper left',
+                                        title="Environment")
 
-                # Draw human's goal as a star - SAME COLOR but different shape
-                if not any(self.human_positions[a] == goal for a in self.humans):
-                    self.ax.scatter(goal[1], goal[0], s=180, marker='*',
-                                    color=human_color,  # Same color as human
-                                    edgecolors='black', linewidth=1)
+            # Keep first legend when adding second
+            self.ax.add_artist(first_legend)
+            
+            # Add agents legend
+            second_legend = self.ax.legend(handles=agent_legend_elements,
+                                        bbox_to_anchor=(1.25, 1),
+                                        loc='upper left',
+                                        title="Agents")
 
-            # Add a generic "Human" entry to the legend
-            legend_elements.append(
-                plt.Line2D([0], [0], marker='^', color='w', markerfacecolor='black', markersize=12, label='Human')
-            )
+            # Calculate dynamic font sizes for tables
+            table_font_size = max(8, int(10 * scale_factor))
+            title_font_size = max(10, int(12 * scale_factor))
+            
+            # Prepare data for completed deliveries table
+            table_data = []
+            for i, agent in enumerate(sorted(self.agents)):
+                color_idx = i % len(agent_colors)
+                agent_color = agent_colors[color_idx]
+                table_data.append([f"Agent {i}", f"{self.completed_tasks[agent]}"])
 
-            # Add legends in two columns for better space usage
-            # Environment components and agents 0-4 in first column
-            legend_elements.extend(agent_legend_col1)
-            first_legend = self.ax.legend(handles=legend_elements,
-                                          bbox_to_anchor=(1.05, 1),
-                                          loc='upper left',
-                                          title="Environment & Agents 0-4")
+            # Create main table with delivery counts
+            table_height = min(0.3, 0.05 * len(table_data) + 0.1)
+            table = self.ax.table(cellText=table_data,
+                                colLabels=["Agent", "Deliveries"],
+                                loc='center right',
+                                cellLoc='center',
+                                bbox=[1.05, 0.25, 0.2, table_height])
 
-            # Add second legend for agents 5-9 if they exist
-            if agent_legend_col2:
-                self.ax.add_artist(first_legend)
-                second_legend = self.ax.legend(handles=agent_legend_col2,
-                                               bbox_to_anchor=(1.25, 1),
-                                               loc='upper left',
-                                               title="Agents 5-9")
+            # Style main table with dynamic sizing
+            table.auto_set_font_size(False)
+            table.set_fontsize(table_font_size)
+            table.scale(1.2 * scale_factor, 1.5 * scale_factor)
 
-            # Draw the figure and pause to show it
+            # Style table cells with colors
+            for (i, j), cell in table.get_celld().items():
+                if i == 0:  # Header row
+                    cell.set_text_props(fontweight='bold')
+                    cell.set_facecolor('lightgray')
+                elif j == 0:  # Agent column
+                    agent_idx = i - 1
+                    color_idx = agent_idx % len(agent_colors)
+                    color = plt.matplotlib.colors.to_rgba(agent_colors[color_idx], alpha=0.2)
+                    cell.set_facecolor(color)
+                elif j == 1:  # Deliveries column
+                    cell.set_facecolor('#f8f8f8')
+
+            # Calculate table width based on content
+            title_text = "Completed Deliveries"
+            table_width = max(0.2, len(title_text) * 0.015 * scale_factor)  
+            
+            # Create title table for deliveries section
+            title_bbox = [1.05, 0.55, table_width, 0.05]
+            title_table = self.ax.table(cellText=[[title_text]],
+                                        loc='center right',
+                                        cellLoc='center',
+                                        bbox=title_bbox)
+
+            # Style title table
+            title_cell = title_table._cells[(0, 0)]
+            title_cell.set_text_props(fontweight='bold', fontsize=title_font_size)
+            title_cell.set_facecolor('lightgray')
+            title_table.auto_set_font_size(False)
+            title_table.set_fontsize(title_font_size)
+            title_table.scale(1.2 * scale_factor, 1.0 * scale_factor)
+            
+            # Ensure both tables use consistent width
+            table._bbox = [1.05, 0.25, table_width, table_height]
+
+            # Draw figure and display
             self.fig.tight_layout()
             self.fig.canvas.draw()
-            plt.pause(0.01)  # Small pause to allow the figure to update
+            plt.pause(0.01)
             return self.fig
+
+    def _toggle_goal_lines(self, event):
+        """Toggle visibility of goal lines when button is clicked"""
+        self.show_goal_lines = not self.show_goal_lines
+        
+        # Update the button text based on current state
+        self.button_text = "Hide Goal Lines" if self.show_goal_lines else "Show Goal Lines"
+        self.button.label.set_text(self.button_text)
+        
+        # Toggle the visibility of the lines
+        for line in self.goal_lines:
+            line.set_visible(self.show_goal_lines)
+        
+        self.fig.canvas.draw_idle()  # Redraw the figure to show changes
 
     def _get_observation(self, agent):
         """

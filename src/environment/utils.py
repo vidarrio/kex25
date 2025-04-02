@@ -8,9 +8,11 @@ import numpy as np
 class SimpleHumanPlanner:
     def __init__(self):
         """
-        Initialize the simple human planner
+        Initialize the simple human planner with position history
         """
         self.last_positions = {}  # Stores the last position for each human
+        self.position_history = {}  # Stores recent positions to detect cycles
+        self.history_length = 8  # How many recent positions to track for cycle detection
 
     def get_actions(self, humans, human_positions, human_goals, grid_size, grid):
         """
@@ -22,15 +24,32 @@ class SimpleHumanPlanner:
         for human in humans:
             current = human_positions[human]
             goal = human_goals[human]
-            action = self.compute_action(current, goal, human, human_goals=human_goals, grid_size=grid_size, grid=grid)
+            
+            # Initialize position history for this human if needed
+            if human not in self.position_history:
+                self.position_history[human] = []
+            
+            # Check if we're in a cycle (same position visited multiple times)
+            if self._is_in_cycle(human, current):
+                # Break the cycle by assigning a new random goal
+                print(f"Human {human} detected in a cycle. Assigning new goal.")
+                assign_new_human_goal(human, human_goals, grid, grid_size)
+                goal = human_goals[human]
+                # Clear the position history to start fresh
+                self.position_history[human] = []
+            
+            action = self.compute_action(current, goal, human, human_goals, grid_size, grid)
             human_actions[human] = action
-        
+            
+            # Update the position history
+            self._update_position_history(human, current)
+            
             # Update the last position for this human:
             moves = {
-                0: (0, -1),    # LEFT: increase row index 
-                1: (1, 0),    # UP: increase column index 
-                2: (0, 1),   # RIGHT: decrease row index
-                3: (-1, 0)    # DOWN: decrease column index
+                0: (0, -1),  # LEFT
+                1: (1, 0),   # DOWN
+                2: (0, 1),   # RIGHT 
+                3: (-1, 0)   # UP
             }
             if action in moves:
                 delta = moves[action]
@@ -38,7 +57,56 @@ class SimpleHumanPlanner:
                 self.last_positions[human] = current  # record current position as last
             else:
                 self.last_positions[human] = current
+                
         return human_actions
+    
+    def _update_position_history(self, human, position):
+        """
+        Update the position history for a human
+        """
+        self.position_history[human].append(position)
+        # Keep only the most recent positions
+        if len(self.position_history[human]) > self.history_length:
+            self.position_history[human].pop(0)
+    
+    def _is_in_cycle(self, human, position):
+        """
+        Check if a human is stuck in a movement cycle
+        Only detect true movement cycles, not waiting patterns
+        """
+        history = self.position_history.get(human, [])
+        
+        # Need at least 6 positions to detect a real cycle
+        if len(history) < 6:
+            return False
+        
+        # Check if we've been at the same position repeatedly with movement in between
+        # This indicates a cycle rather than waiting
+        if position in history[:-1]:  # Check if current position was seen before
+            # Find indices where this position appears
+            indices = [i for i, pos in enumerate(history) if pos == position]
+            
+            if len(indices) >= 2:
+                # Check if there was movement between the occurrences
+                # Extract the positions between previous occurrence and now
+                last_idx = indices[-2]  # Second-to-last occurrence
+                between_positions = history[last_idx+1:-1]
+                
+                # If there were at least 2 different positions between occurrences,
+                # this is a true cycle, not just waiting in place
+                unique_between = set(between_positions)
+                if len(unique_between) >= 2 and position in unique_between:
+                    return True
+        
+        # Detect repeating patterns (rectangular movement)
+        if len(history) >= 8:
+            # Check for a 4-step movement cycle that repeats
+            # But only if the pattern contains different positions (true movement)
+            pattern = history[-4:]
+            if pattern == history[-8:-4] and len(set(pattern)) > 1:
+                return True
+        
+        return False
 
     def compute_action(self, current, goal, human, human_goals, grid_size, grid):
         """
