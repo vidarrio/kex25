@@ -2,12 +2,12 @@ import heapq
 import numpy as np
 import time
 
-from .human_planner import SimpleHumanPlanner
 DEBUG_NONE = 0
 DEBUG_CRITICAL = 1
 DEBUG_INFO = 2
 DEBUG_VERBOSE = 3
 DEBUG_ALL = 4
+DEBUG_SPECIFIC = 5
 
 class AStarAgent:
     """
@@ -53,7 +53,7 @@ class AStarAgent:
 
     def debug(self, level, message):
         """Print debug message if current debug level is high enough."""
-        if self.debug_level >= level:
+        if self.debug_level >= level or level == DEBUG_SPECIFIC:
             print(message)
 
     def plan_all_paths(self):
@@ -457,12 +457,11 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
         n_steps: Number of steps to run
         debug_level: Debug level (default: INFO)
     """
-    human_planner = SimpleHumanPlanner(env)
     # Initialize the A* agent
     a_star_agent = AStarAgent(env)
 
     # Reset the environment
-    observations, _, _, _ = env.reset()
+    observations, _ = env.reset()
 
     # Initial planning for all agents
     a_star_agent.debug(DEBUG_CRITICAL, "\nInitial planning...")
@@ -472,10 +471,12 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
     for step in range(n_steps):
         # Get actions from A* agent
         actions = a_star_agent.get_actions()
-        human_actions = human_planner.get_actions()
+
+        # Debug
+        a_star_agent.debug(DEBUG_SPECIFIC, f"Step {step} actions: {actions}")
         
         # Step the environment
-        observations, rewards, terminations, truncations, infos, human_observations, human_info = env.step(actions, human_actions)
+        observations, rewards, terminations, truncations, infos = env.step(actions)
 
         # Check if any pickup/dropoff actions were performed
         if a_star_agent.handle_post_action_state(actions):

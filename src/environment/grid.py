@@ -7,11 +7,14 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 import random
 import functools
+import os
+import sys
+from .utils import SimpleHumanPlanner, get_random_empty_position, assign_new_human_goal
 
 class WarehouseEnv(ParallelEnv):
     metadata = {'render_modes': ['human', 'rgb_array'], 'name': 'warehouse_v0'}
 
-    def __init__(self, grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, num_dynamic_obstacles=10, 
+    def __init__(self, grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, 
                  num_pickup_points=3, num_dropoff_points=2, collision_penalty=-2, task_reward=10, step_cost=-0.1, 
                  render_mode=None):
         super().__init__()
@@ -21,7 +24,6 @@ class WarehouseEnv(ParallelEnv):
         self.n_agents = n_agents
         self.n_humans = n_humans
         self.num_shelves = num_shelves
-        self.num_dynamic_obstacles = num_dynamic_obstacles
         self.num_pickup_points = num_pickup_points
         self.num_dropoff_points = num_dropoff_points
         self.collision_penalty = collision_penalty
@@ -35,6 +37,9 @@ class WarehouseEnv(ParallelEnv):
         # Create list of possible humans
         self.possible_humans = ["human_" + str(i) for i in range(self.n_humans)]
         
+        # Create a SimpleHumanPlanner to handle human actions
+        self.human_planner = SimpleHumanPlanner()
+
         # Initialize grid and agent data
         self.reset()
 
@@ -43,15 +48,14 @@ class WarehouseEnv(ParallelEnv):
         """
         Return the action space for a specific agent
         The action space is discrete with the following actions:
-        0: Move Up
-        1: Move Right
-        2: Move Down
-        3: Move Left
+        0: Move Left (decrease column)
+        1: Move Down (increase row)
+        2: Move Right (increase column)
+        3: Move Up (decrease row)
         4: Pickup Item
         5: Drop Item
         6: Wait
         """
-
         return spaces.Discrete(7)
 
     @functools.lru_cache(maxsize=None)
@@ -113,38 +117,31 @@ class WarehouseEnv(ParallelEnv):
 
         for agent in self.agents:
             # Find empty position
-            pos = self._get_random_empty_position()
+            pos = get_random_empty_position(grid=self.grid, grid_size=self.grid_size)
             self.agent_positions[agent] = pos
-            self.grid[pos] = 4
+            self.grid[pos] = 1
 
             # Assign initial goal (pickup point)
             self._assign_new_goal(agent)
             
          # Initialize humans at random positions
         self.human_positions = {}
-        self.human_carrying = {human: False for human in self.humans} # Possible to have humans carry a package
         self.human_goals = {}
-        self.human_item_types = {} # What type of item the human is carrying (possible extension)
 
         for human in self.humans:
             # Find empty position
-            pos = self._get_random_empty_position()
+            pos = get_random_empty_position(grid=self.grid, grid_size=self.grid_size)
             self.human_positions[human] = pos
-            self.grid[pos] = 1
+            self.grid[pos] = 3
 
             # Assign initial goal (pickup point)
-            self._assign_new_human_goal(human)
+            assign_new_human_goal(human, self.human_goals, self.grid, self.grid_size)
             
         # Metrics tracking
         self.steps = 0
         self.completed_tasks = {agent: 0 for agent in self.agents}
         self.collisions = {agent: 0 for agent in self.agents}
         self.total_distance = {agent: 0 for agent in self.agents}
-        
-        # Metrics for the humans
-        self.human_completed_tasks = {human: 0 for human in self.humans}
-        self.human_collisions = {human: 0 for human in self.humans}
-        self.human_total_distance = {human: 0 for human in self.humans}
 
         # Create observations
         observations = {agent: self._get_observation(agent) for agent in self.agents}
@@ -155,20 +152,10 @@ class WarehouseEnv(ParallelEnv):
             "goal": self.agent_goals[agent],
             "carrying": self.agent_carrying[agent],
         } for agent in self.agents}
-    
-        # Create human observations
-        human_observations= {human: self._get_human_observation(human) for human in self.humans}
 
-        # Create info dict for additional data
-        human_info = {human: {
-            "position": self.human_positions[human],
-            "goal": self.human_goals[human],
-            "carrying": self.human_carrying[human],
-        } for human in self.humans}
-
-        return observations, info, human_observations, human_info
+        return observations, info
     
-    def step(self, actions, human_actions):
+    def step(self, actions):
         self.steps += 1
 
         # Initialize for active agents
@@ -196,32 +183,14 @@ class WarehouseEnv(ParallelEnv):
         agents_order = list(self.agents)
         humans_order = list(self.humans)
         random.shuffle(agents_order)
-        random.shuffle(humans_order)       
+        random.shuffle(humans_order)
 
-        # First pass: compute new positions
-        new_positions = {}
-        for agent in agents_order:
-            action = actions[agent]
-            current_pos = self.agent_positions[agent]
-            new_pos = current_pos # Default: stay in place
+        # Process humans first
 
-            # Execute movement actions (0-3)
-            if action < 4: # Movement actions
-                # Compute new position
-                delta_row, delta_col = [(0, -1), (1, 0), (0, 1), (-1, 0)][action]
-                new_row = current_pos[0] + delta_row
-                new_col = current_pos[1] + delta_col
+        # Get actions for humans
+        human_actions = self.human_planner.get_actions(humans=self.humans, human_positions=self.human_positions,
+                                                        human_goals=self.human_goals, grid=self.grid, grid_size=self.grid_size)
 
-                # Check boundaries and obstacles
-                if (0 <= new_row < self.grid_size[0] and 
-                    0 <= new_col < self.grid_size[1] and
-                    self.grid[new_row, new_col] not in [2, 3]): # Not a shelf or dynamic obstacle
-                        new_pos = (new_row, new_col)
-                        self.total_distance[agent] += 1
-            
-            # Store intended position
-            new_positions[agent] = new_pos
-        
         # First pass: compute new positions for humans
         humans_new_positions = {}
         for human in humans_order:
@@ -239,32 +208,81 @@ class WarehouseEnv(ParallelEnv):
                 # Check boundaries and obstacles
                 if (0 <= new_row < self.grid_size[0] and 
                     0 <= new_col < self.grid_size[1] and
-                    self.grid[new_row, new_col] not in [2, 3]): # Not a shelf or dynamic obstacle
+                    self.grid[new_row, new_col] not in [1, 2]): # Not an agent or shelf
                         new_pos = (new_row, new_col)
-                        # self.total_distance[human] += 1
             
             # Store intended position
             humans_new_positions[human] = new_pos
-        
+
         # Second pass: Resolve conflicts
-    
+
         # Current positions of all agents and humans
         current_positions = {agent: self.agent_positions[agent] for agent in self.agents}
         human_current_positions = {human: self.human_positions[human] for human in self.humans}
 
-        reserved_positions = {}
+        human_reserved_positions = {}
+
         # Resolve human conflicts
-        final_human_positions, human_collisions, reserved_positions = second_pass(
+        final_human_positions, human_collisions, human_reserved_positions = second_pass(
             humans_order,
             human_current_positions,
             humans_new_positions,
             human_actions,
             self.humans,
-            reserved_positions,
+            human_reserved_positions,
             allow_overlap=True
         )
 
-        # resolve agent conflicts
+        # Third pass: Update all human positions
+        for human in self.humans:
+            current_pos = self.human_positions[human]
+            new_pos = final_human_positions[human]
+
+            if current_pos != new_pos:
+                # Clear old position in grid
+                self.grid[current_pos] = 0
+                # Update human position
+                self.human_positions[human] = new_pos
+                # Mark new position in grid
+                self.grid[new_pos] = 1
+
+        # Fourth pass: Handle human pickup/dropoff/wait actions
+        for human in self.humans:
+            human_action = human_actions[human]
+            current_pos = self.human_positions[human]
+            self._fourth_pass(human, human_action, current_pos, rewards)
+
+        # Process agents
+
+        # First pass: compute new positions
+        new_positions = {}
+        for agent in agents_order:
+            action = actions[agent]
+            current_pos = self.agent_positions[agent]
+            new_pos = current_pos # Default: stay in place
+
+            # Execute movement actions (0-3)
+            if action < 4: # Movement actions
+                # Compute new position
+                delta_row, delta_col = [(0, -1), (1, 0), (0, 1), (-1, 0)][action]  # Left, Down, Right, Up
+                new_row = current_pos[0] + delta_row
+                new_col = current_pos[1] + delta_col
+
+                # Check boundaries and obstacles
+                if (0 <= new_row < self.grid_size[0] and 
+                    0 <= new_col < self.grid_size[1] and
+                    self.grid[new_row, new_col] not in [2, 3]): # Not a shelf or human
+                        new_pos = (new_row, new_col)
+                        self.total_distance[agent] += 1
+            
+            # Store intended position
+            new_positions[agent] = new_pos
+        
+        
+        
+        # Second pass: Resolve conflicts
+        reserved_positions = {}
+        # Resolve conflicts
         final_positions, collision_agents, reserved_positions = second_pass(
             agents_order, 
             current_positions, 
@@ -274,8 +292,6 @@ class WarehouseEnv(ParallelEnv):
             reserved_positions,
             allow_overlap=False
         )
-
-        
         
         # Third pass: Update all positions
         for agent in self.agents:
@@ -294,30 +310,12 @@ class WarehouseEnv(ParallelEnv):
             if agent in collision_agents:
                 rewards[agent] += self.collision_penalty
                 self.collisions[agent] += 1
-                
-        # Third pass: Update all positions (Humans)
-        for human in self.humans:
-            current_pos = self.human_positions[human]
-            new_pos = final_human_positions[human]
-
-            if current_pos != new_pos:
-                # Clear old position in grid
-                self.grid[current_pos] = 0
-                # Update human position
-                self.human_positions[human] = new_pos
-                # Mark new position in grid
-                self.grid[new_pos] = 1
 
         # Fourth pass: Handle pickup/dropoff/wait actions
         for agent in self.agents:
             action = actions[agent]
             current_pos = self.agent_positions[agent]
             self._fourth_pass(agent, action, current_pos, rewards)
-            
-        for human in self.humans:
-            human_action = human_actions[human]
-            current_pos = self.human_positions[human]
-            self._fourth_pass(human, human_action, current_pos, rewards)
 
         # Check for termination criteria (e.g. max steps etc.)
         # In a warehouse setting, we might not have a natural termination point
@@ -329,7 +327,6 @@ class WarehouseEnv(ParallelEnv):
 
         # Create observations
         observations = {agent: self._get_observation(agent) for agent in self.agents}
-        human_observations = {human: self._get_human_observation(human) for human in self.humans}
 
         # Optional info dict for additional data
         info = {}
@@ -342,23 +339,9 @@ class WarehouseEnv(ParallelEnv):
                     "completed_tasks": self.completed_tasks[agent],
                 }
             else:
-                # Basic info for inactive agents§
+                # Basic info for inactive agents
                 info[agent] = {"active": False}
-        
-        human_info = {}
-        for human in self.possible_humans:
-            if human in self.humans:
-                info[human] = {
-                    "position": self.human_positions[human],
-                    "goal": self.human_goals[human],
-                    "carrying": self.human_carrying[human],
-                    "completed_tasks": self.human_completed_tasks[human],
-                }
-            else:
-                # Basic info for inactive humans§
-                human_info[human] = {"active": False}
 
-        # Add at the end of your step method
         # Verify no agents are sharing positions
         position_count = {}
         for agent, pos in self.agent_positions.items():
@@ -370,14 +353,14 @@ class WarehouseEnv(ParallelEnv):
             if len(agents) > 1:
                 print(f"WARNING: Position {pos} is shared by agents: {agents}")
         
-        return observations, rewards, terminations, truncations, info, human_observations, human_info
+        return observations, rewards, terminations, truncations, info
     
     def render(self):
         """Render the warehouse environment with support for up to 10 agents"""
         if self.render_mode is None:
             gymnasium.logger.warn("Render mode not set. Use 'human' or 'rgb_array'.")
             return
-        
+
         # For human rendering, use a persistent figure
         if self.render_mode == 'human':
             # Initialize the figure on first call
@@ -386,21 +369,21 @@ class WarehouseEnv(ParallelEnv):
             else:
                 # Clear the previous content but keep the figure
                 self.ax.clear()
-            
+
             # Draw a white background grid first
             background = np.zeros(self.grid_size)
             self.ax.imshow(background, cmap='Greys', alpha=0.1, origin='upper')
-            
+
             # Set up the grid
             self.ax.set_xlim(-0.5, self.grid_size[1] - 0.5)
             self.ax.set_ylim(-0.5, self.grid_size[0] - 0.5)
             self.ax.set_xticks(np.arange(-0.5, self.grid_size[1], 1), minor=True)
             self.ax.set_yticks(np.arange(-0.5, self.grid_size[0], 1), minor=True)
             self.ax.grid(which='minor', color='grey', linestyle='-', linewidth=0.5)
-            
+
             # Remove axis labels and ticks for cleaner look
             self.ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
-            
+
             # Draw shelves as black squares
             shelf_r, shelf_c = [], []
             for r in range(self.grid_size[0]):
@@ -410,7 +393,7 @@ class WarehouseEnv(ParallelEnv):
                         shelf_c.append(c)
             if shelf_r:  # Only draw if there are shelves
                 self.ax.scatter(shelf_c, shelf_r, s=180, marker='s', color='black', label='Shelf')
-            
+
             # Draw pickup points as green circles
             pickup_r, pickup_c = [], []
             for pos in self.pickup_points:
@@ -418,7 +401,7 @@ class WarehouseEnv(ParallelEnv):
                 pickup_c.append(pos[1])
             if pickup_r:  # Only draw if there are pickup points
                 self.ax.scatter(pickup_c, pickup_r, s=150, marker='o', color='limegreen', label='Pickup Point')
-            
+
             # Draw dropoff points as red diamonds
             dropoff_r, dropoff_c = [], []
             for pos in self.dropoff_points:
@@ -426,24 +409,24 @@ class WarehouseEnv(ParallelEnv):
                 dropoff_c.append(pos[1])
             if dropoff_r:  # Only draw if there are dropoff points
                 self.ax.scatter(dropoff_c, dropoff_r, s=150, marker='D', color='tomato', label='Dropoff Point')
-            
+
             # Define agent colors - expanded to 10 distinct colors
             agent_colors = [
                 'darkorange', 'mediumblue', 'purple', 'deeppink', 'teal',
                 'gold', 'darkred', 'forestgreen', 'brown', 'slateblue'
             ]
-            
+
             # Create legend elements for environment components
             legend_elements = [
                 plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='black', markersize=12, label='Shelf'),
                 plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='limegreen', markersize=12, label='Pickup Point'),
                 plt.Line2D([0], [0], marker='D', color='w', markerfacecolor='tomato', markersize=12, label='Dropoff Point'),
             ]
-            
+
             # Draw agents in two legend columns to save space
             agent_legend_col1 = []
             agent_legend_col2 = []
-            
+
             # Draw each agent and its goal with the SAME color but DIFFERENT shapes
             for i, agent in enumerate(self.agents):
                 color_idx = i % len(agent_colors)
@@ -451,265 +434,101 @@ class WarehouseEnv(ParallelEnv):
                 pos = self.agent_positions[agent]
                 goal = self.agent_goals[agent]
                 carrying = self.agent_carrying[agent]
-                
+
                 # Draw agent as a triangle (with black edge for visibility)
-                self.ax.scatter(pos[1], pos[0], s=180, marker='^', 
-                              color=agent_color, 
-                              edgecolors='black', linewidth=1.5)
-                
+                self.ax.scatter(pos[1], pos[0], s=180, marker='^',
+                                color=agent_color,
+                                edgecolors='black', linewidth=1.5)
+
                 # Draw a circle around agent if carrying
                 if carrying:
-                    self.ax.scatter(pos[1], pos[0], s=280, marker='o', 
-                                   facecolors='none', edgecolors=agent_color, 
-                                   alpha=0.6, linewidth=2)
-                
+                    self.ax.scatter(pos[1], pos[0], s=280, marker='o',
+                                    facecolors='none', edgecolors=agent_color,
+                                    alpha=0.6, linewidth=2)
+
                 # Draw agent's goal as a star - SAME COLOR but different shape
                 # Only if not already placed as an agent
                 if not any(self.agent_positions[a] == goal for a in self.agents):
-                    self.ax.scatter(goal[1], goal[0], s=180, marker='*', 
-                                  color=agent_color,  # Same color as agent
-                                  edgecolors='black', linewidth=1)
-                
+                    self.ax.scatter(goal[1], goal[0], s=180, marker='*',
+                                    color=agent_color,  # Same color as agent
+                                    edgecolors='black', linewidth=1)
+
                 # Add agent to legend with carrying status and goal indicator using same color
                 carry_status = "🔄" if carrying else "✓"
-                
+
                 # Put legend elements into appropriate columns (agents 0-4 in col1, 5-9 in col2)
                 if i < 5:
                     agent_legend_col1.append(
-                        plt.Line2D([0], [0], marker='^', color='w', 
-                                 markerfacecolor=agent_color,
-                                 markersize=12, 
-                                 label=f"Agent {i} ({carry_status})")
+                        plt.Line2D([0], [0], marker='^', color='w',
+                                   markerfacecolor=agent_color,
+                                   markersize=12,
+                                   label=f"Agent {i} ({carry_status})")
                     )
-                    
+
                     agent_legend_col1.append(
-                        plt.Line2D([0], [0], marker='*', color='w', 
-                                 markerfacecolor=agent_color,  # Same color as agent
-                                 markersize=14, 
-                                 label=f"Agent {i}'s Goal")
+                        plt.Line2D([0], [0], marker='*', color='w',
+                                   markerfacecolor=agent_color,  # Same color as agent
+                                   markersize=14,
+                                   label=f"Agent {i}'s Goal")
                     )
                 else:
                     agent_legend_col2.append(
-                        plt.Line2D([0], [0], marker='^', color='w', 
-                                 markerfacecolor=agent_color,
-                                 markersize=12, 
-                                 label=f"Agent {i} ({carry_status})")
+                        plt.Line2D([0], [0], marker='^', color='w',
+                                   markerfacecolor=agent_color,
+                                   markersize=12,
+                                   label=f"Agent {i} ({carry_status})")
                     )
-                    
+
                     agent_legend_col2.append(
-                        plt.Line2D([0], [0], marker='*', color='w', 
-                                 markerfacecolor=agent_color,  # Same color as agent
-                                 markersize=14, 
-                                 label=f"Agent {i}'s Goal")
+                        plt.Line2D([0], [0], marker='*', color='w',
+                                   markerfacecolor=agent_color,  # Same color as agent
+                                   markersize=14,
+                                   label=f"Agent {i}'s Goal")
                     )
-                    
-                    
-            # Draw agents in two legend columns to save space
-            human_legend_col1 = []
-            human_legend_col2 = []
-            
-            # Draw each human and its goal with the SAME color but DIFFERENT shapes
-            for i, human in enumerate(self.humans):
-                # color_idx = "black"
+
+            # Draw humans as black triangles
+            for human in self.humans:
                 human_color = "black"
                 pos = self.human_positions[human]
                 goal = self.human_goals[human]
-                carrying = self.human_carrying[human]
-                
+
                 # Draw human as a triangle (with black edge for visibility)
-                self.ax.scatter(pos[1], pos[0], s=180, marker='^', 
-                              color=human_color, 
-                              edgecolors='black', linewidth=1.5)
-                
-                # Draw a circle around human if carrying
-                if carrying:
-                    self.ax.scatter(pos[1], pos[0], s=280, marker='o', 
-                                   facecolors='none', edgecolors=human_color, 
-                                   alpha=0.6, linewidth=2)
-                
+                self.ax.scatter(pos[1], pos[0], s=180, marker='^',
+                                color=human_color,
+                                edgecolors='black', linewidth=1.5)
+
                 # Draw human's goal as a star - SAME COLOR but different shape
-                # Only if not already placed as an human
                 if not any(self.human_positions[a] == goal for a in self.humans):
-                    self.ax.scatter(goal[1], goal[0], s=180, marker='*', 
-                                  color=human_color,  # Same color as human
-                                  edgecolors='black', linewidth=1)
-                
-                # Add human to legend with carrying status and goal indicator using same color
-                carry_status = "🔄" if carrying else "✓"
-                
-                # Put legend elements into appropriate columns (humans 0-4 in col1, 5-9 in col2)
-                if i < 5:
-                    human_legend_col1.append(
-                        plt.Line2D([0], [0], marker='^', color='w', 
-                                 markerfacecolor=human_color,
-                                 markersize=12, 
-                                 label=f"Human {i} ({carry_status})")
-                    )
-                    
-                    human_legend_col1.append(
-                        plt.Line2D([0], [0], marker='*', color='w', 
-                                 markerfacecolor=human_color,  # Same color as human
-                                 markersize=14, 
-                                 label=f"Human {i}'s Goal")
-                    )
-                else:
-                    human_legend_col2.append(
-                        plt.Line2D([0], [0], marker='^', color='w', 
-                                 markerfacecolor=human_color,
-                                 markersize=12, 
-                                 label=f"Human {i} ({carry_status})")
-                    )
-                    
-                    human_legend_col2.append(
-                        plt.Line2D([0], [0], marker='*', color='w', 
-                                 markerfacecolor=human_color,  # Same color as human
-                                 markersize=14, 
-                                 label=f"Human {i}'s Goal")
-                    )
-            
-            # Add status text with agent carrying status in compact form
-            status_rows = []
-            for i in range(0, len(self.agents), 5):  # Group agents in rows of 5
-                status_chunk = []
-                for j in range(5):
-                    if i + j < len(self.agents):
-                        a = self.agents[i + j]
-                        status_chunk.append(f"A{i+j}: {'🔄' if self.agent_carrying[a] else '✓'}")
-                status_rows.append(" | ".join(status_chunk))
-            
-            status_text = "\n".join(status_rows)
-            self.ax.set_title(f"Warehouse Environment - Step {self.steps}\n{status_text}")
-            
+                    self.ax.scatter(goal[1], goal[0], s=180, marker='*',
+                                    color=human_color,  # Same color as human
+                                    edgecolors='black', linewidth=1)
+
+            # Add a generic "Human" entry to the legend
+            legend_elements.append(
+                plt.Line2D([0], [0], marker='^', color='w', markerfacecolor='black', markersize=12, label='Human')
+            )
+
             # Add legends in two columns for better space usage
             # Environment components and agents 0-4 in first column
             legend_elements.extend(agent_legend_col1)
-            first_legend = self.ax.legend(handles=legend_elements, 
-                                         bbox_to_anchor=(1.05, 1), 
-                                         loc='upper left', 
-                                         title="Environment & Agents 0-4")
-            
+            first_legend = self.ax.legend(handles=legend_elements,
+                                          bbox_to_anchor=(1.05, 1),
+                                          loc='upper left',
+                                          title="Environment & Agents 0-4")
+
             # Add second legend for agents 5-9 if they exist
             if agent_legend_col2:
                 self.ax.add_artist(first_legend)
                 second_legend = self.ax.legend(handles=agent_legend_col2,
-                                             bbox_to_anchor=(1.25, 1),
-                                             loc='upper left',
-                                             title="Agents 5-9")
-            
-            # Add task counter text
-            task_rows = []
-            for i in range(0, len(self.agents), 5):  # Group tasks in rows of 5
-                task_chunk = []
-                for j in range(5):
-                    if i + j < len(self.agents):
-                        a = self.agents[i + j]
-                        task_chunk.append(f"A{i+j}: {self.completed_tasks[a]}")
-                task_rows.append(" | ".join(task_chunk))
-            
-            task_text = "\n".join(task_rows)
-            props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
-            self.ax.text(1.05, 0.3, f"Completed Tasks:\n{task_text}", 
-                        transform=self.ax.transAxes, fontsize=9,
-                        verticalalignment='center', bbox=props)
-            
+                                               bbox_to_anchor=(1.25, 1),
+                                               loc='upper left',
+                                               title="Agents 5-9")
+
             # Draw the figure and pause to show it
             self.fig.tight_layout()
             self.fig.canvas.draw()
             plt.pause(0.01)  # Small pause to allow the figure to update
             return self.fig
-        
-        # For rgb_array rendering mode (similar updates)
-        elif self.render_mode == 'rgb_array':
-            fig, ax = plt.subplots(figsize=(12, 10))
-            
-            # Draw a white background
-            background = np.zeros(self.grid_size)
-            ax.imshow(background, cmap='Greys', alpha=0.1, origin='upper')
-            
-            # Set up the grid
-            ax.set_xlim(-0.5, self.grid_size[1] - 0.5)
-            ax.set_ylim(-0.5, self.grid_size[0] - 0.5)
-            ax.set_xticks(np.arange(-0.5, self.grid_size[1], 1), minor=True)
-            ax.set_yticks(np.arange(-0.5, self.grid_size[0], 1), minor=True)
-            ax.grid(which='minor', color='grey', linestyle='-', linewidth=0.5)
-            ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
-            
-            # Draw shelves as black squares
-            shelf_r, shelf_c = [], []
-            for r in range(self.grid_size[0]):
-                for c in range(self.grid_size[1]):
-                    if self.grid[r, c] == 2:  # Shelf
-                        shelf_r.append(r)
-                        shelf_c.append(c)
-            if shelf_r:  # Only draw if there are shelves
-                ax.scatter(shelf_c, shelf_r, s=180, marker='s', color='black', label='Shelf')
-            
-            # Draw pickup points as green circles
-            pickup_r, pickup_c = [], []
-            for pos in self.pickup_points:
-                pickup_r.append(pos[0])
-                pickup_c.append(pos[1])
-            if pickup_r:  # Only draw if there are pickup points
-                ax.scatter(pickup_c, pickup_r, s=150, marker='o', color='limegreen', label='Pickup Point')
-            
-            # Draw dropoff points as red diamonds
-            dropoff_r, dropoff_c = [], []
-            for pos in self.dropoff_points:
-                dropoff_r.append(pos[0])
-                dropoff_c.append(pos[1])
-            if dropoff_r:  # Only draw if there are dropoff points
-                ax.scatter(dropoff_c, dropoff_r, s=150, marker='D', color='tomato', label='Dropoff Point')
-            
-            # Define expanded agent colors
-            agent_colors = [
-                'darkorange', 'mediumblue', 'purple', 'deeppink', 'teal',
-                'gold', 'darkred', 'forestgreen', 'brown', 'slateblue'
-            ]
-            
-            # Draw the agents with the same coloring scheme as human mode
-            for i, agent in enumerate(self.agents):
-                color_idx = i % len(agent_colors)
-                agent_color = agent_colors[color_idx]
-                pos = self.agent_positions[agent]
-                goal = self.agent_goals[agent]
-                carrying = self.agent_carrying[agent]
-                
-                # Draw agent as a triangle
-                ax.scatter(pos[1], pos[0], s=180, marker='^', 
-                          color=agent_color, 
-                          edgecolors='black', linewidth=1.5)
-                
-                # Draw a circle around agent if carrying
-                if carrying:
-                    ax.scatter(pos[1], pos[0], s=280, marker='o', 
-                              facecolors='none', edgecolors=agent_color, 
-                              alpha=0.6, linewidth=2)
-                
-                # Draw agent's goal as a star - SAME COLOR as agent
-                if not any(self.agent_positions[a] == goal for a in self.agents):
-                    ax.scatter(goal[1], goal[0], s=180, marker='*', 
-                              color=agent_color,  # Same color as agent
-                              edgecolors='black', linewidth=1)
-            
-            # Add title with compact status info if needed
-            status_rows = []
-            for i in range(0, len(self.agents), 5):  # Group agents in rows of 5
-                status_chunk = []
-                for j in range(5):
-                    if i + j < len(self.agents):
-                        a = self.agents[i + j]
-                        status_chunk.append(f"A{i+j}: {'🔄' if self.agent_carrying[a] else '✓'}")
-                status_rows.append(" | ".join(status_chunk))
-            
-            status_text = "\n".join(status_rows)
-            ax.set_title(f"Warehouse Environment - Step {self.steps}\n{status_text}")
-            
-            # Convert to RGB array
-            fig.tight_layout()
-            fig.canvas.draw()
-            img = np.array(fig.canvas.renderer.buffer_rgba())
-            plt.close(fig)
-            return img
 
     def _get_observation(self, agent):
         """
@@ -831,41 +650,9 @@ class WarehouseEnv(ParallelEnv):
                     # Channel 3: Static obstacles (shelves)
                     obs[2, lr, lc] = 1 if self.grid[gr, gc] == 2 else 0
 
-                    # Channel 4: Dynamic obstacles
-                    obs[3, lr, lc] = 1 if self.grid[gr, gc] == 3 else 0
-
                     # Channel 5: Current goal position
                     obs[4, lr, lc] = 1 if (gr, gc) == self.human_goals[human] else 0
 
-                    # Channel 6: Pickup points
-                    obs[5, lr, lc] = 1 if (gr, gc) in self.pickup_points else 0
-
-                    # Channel 7: Dropoff points
-                    obs[6, lr, lc] = 1 if (gr, gc) in self.dropoff_points else 0
-
-        # Channel 8: human's carrying status
-        obs[7, :, :] = 1 if self.human_carrying[human] else 0
-
-        # Channel 9: Valid pickup/drop indicator
-        if self.human_carrying[human]:
-            # If carrying, mark valid dropoff points
-            dropoff_idx = self.human_item_types[human]
-            for i in range(-window_size, window_size + 1):
-                for j in range(-window_size, window_size + 1):
-                    gr, gc = r + i, c + j
-                    lr, lc = i + window_size, j + window_size
-                    if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
-                        if (gr, gc) == self.dropoff_points[dropoff_idx]:
-                            obs[8, lr, lc] = 1
-        else:
-            # If not carrying, mark all pickup points as valid
-            for i in range(-window_size, window_size + 1):
-                for j in range(-window_size, window_size + 1):
-                    gr, gc = r + i, c + j
-                    lr, lc = i + window_size, j + window_size
-                    if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
-                        if (gr, gc) in self.pickup_points:
-                            obs[8, lr, lc] = 1
 
         return obs
     
@@ -1012,20 +799,9 @@ class WarehouseEnv(ParallelEnv):
         """
         points = []
         for _ in range(num_points):
-            pos = self._get_random_empty_position(avoid_values)
+            pos = get_random_empty_position(grid=self.grid, grid_size=self.grid_size, avoid_values=avoid_values)
             points.append(pos)
         return points
-    
-    def _get_random_empty_position(self, avoid_values=[1, 2, 3, 4, 5]):
-        """
-        Get a random empty position on the grid, avoiding certain cell types
-        """
-        while True:
-            r = random.randint(0, self.grid_size[0] - 1)
-            c = random.randint(0, self.grid_size[1] - 1)
-
-            if self.grid[r, c] not in avoid_values:
-                return (r, c)
             
     def _assign_new_goal(self, agent):
         """
@@ -1040,17 +816,6 @@ class WarehouseEnv(ParallelEnv):
             # If agent is not carrying an item, go to a random pickup point
             pickup_idx = random.randint(0, len(self.pickup_points) - 1)
             self.agent_goals[agent] = self.pickup_points[pickup_idx]
-            
-    def _assign_new_human_goal(self, human):
-        """
-        Assign a new random goal to the human.
-        The new goal is selected from an empty cell on the grid, avoiding shelves (2)
-        and dynamic obstacles (3). Humans do not carry anything, so we ignore pickup/dropoff points.
-        """
-        # Allow cells that are not shelves (2) or dynamic obstacles (3)
-        self.human_goals[human] = self._get_random_empty_position(avoid_values=[2, 3])
-
-            
             
     def _fourth_pass(self, agent, action, current_pos, rewards):
 
@@ -1146,7 +911,8 @@ def second_pass(entities_order, current_positions, new_positions, actions, all_e
         swap_collision = any(
             other_entity != entity and
             current_positions[other_entity] == intended_pos and
-            new_positions.get(other_entity) == current_pos
+            new_positions.get(other_entity) == current_pos and
+            not allow_overlap
             for other_entity in all_entities
         )
         if swap_collision:
@@ -1164,14 +930,10 @@ def second_pass(entities_order, current_positions, new_positions, actions, all_e
     
     return final_positions, collision_entities, reserved_positions
 
-    
-
-
 # Wrapper for the environment
-def env(grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, num_dynamic_obstacles=10, 
+def env(grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, 
         num_pickup_points=3, num_dropoff_points=2, render_mode=None):
     env = WarehouseEnv(grid_size=grid_size, n_agents=n_agents, n_humans=n_humans, num_shelves=num_shelves, 
-                       num_dynamic_obstacles=num_dynamic_obstacles, num_pickup_points=num_pickup_points, 
-                       num_dropoff_points=num_dropoff_points, render_mode=render_mode)
+                        num_pickup_points=num_pickup_points, num_dropoff_points=num_dropoff_points, render_mode=render_mode)
     # env = wrappers.CaptureStdoutWrapper(env)
     return env
