@@ -15,13 +15,14 @@ from matplotlib.widgets import Button
 class WarehouseEnv(ParallelEnv):
     metadata = {'render_modes': ['human', 'rgb_array'], 'name': 'warehouse_v0'}
 
-    def __init__(self, grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, 
+    def __init__(self, grid_size=(20, 20), human_grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, 
                  num_pickup_points=3, num_dropoff_points=2, collision_penalty=-2, task_reward=10, step_cost=-0.1, 
                  render_mode=None):
         super().__init__()
 
         # Environment parameters
         self.grid_size = grid_size
+        self.human_grid_size = human_grid_size
         self.n_agents = n_agents
         self.n_humans = n_humans
         self.num_shelves = num_shelves
@@ -131,12 +132,12 @@ class WarehouseEnv(ParallelEnv):
 
         for human in self.humans:
             # Find empty position
-            pos = get_random_empty_position(grid=self.grid, grid_size=self.grid_size)
+            pos = get_random_empty_position(grid=self.grid, grid_size=self.human_grid_size)
             self.human_positions[human] = pos
             self.grid[pos] = 3
 
             # Assign initial goal (pickup point)
-            assign_new_human_goal(human, self.human_goals, self.grid, self.grid_size)
+            assign_new_human_goal(human, self.human_goals, self.grid, self.human_grid_size)
             
         # Metrics tracking
         self.steps = 0
@@ -190,8 +191,7 @@ class WarehouseEnv(ParallelEnv):
 
         # Get actions for humans
         human_actions = self.human_planner.get_actions(humans=self.humans, human_positions=self.human_positions,
-                                                        human_goals=self.human_goals, grid=self.grid, grid_size=self.grid_size)
-
+                                                    human_goals=self.human_goals, grid=self.grid, grid_size=self.human_grid_size)
         # First pass: compute new positions for humans
         humans_new_positions = {}
         for human in humans_order:
@@ -733,7 +733,7 @@ class WarehouseEnv(ParallelEnv):
                 lr, lc = i + window_size, j + window_size
 
                 # Check if the global coordinates are within bounds
-                if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
+                if 0 <= gr < self.human_grid_size[0] and 0 <= gc < self.human_grid_size[1]:
                     # Channel 1: human position (only at the center)
                     if i == 0 and j == 0:
                         obs[0, lr, lc] = 1
@@ -1030,9 +1030,9 @@ def second_pass(entities_order, current_positions, new_positions, actions, all_e
     return final_positions, collision_entities, reserved_positions
 
 # Wrapper for the environment
-def env(grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, 
+def env(grid_size=(20, 20), human_grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, 
         num_pickup_points=3, num_dropoff_points=2, render_mode=None):
-    env = WarehouseEnv(grid_size=grid_size, n_agents=n_agents, n_humans=n_humans, num_shelves=num_shelves, 
+    env = WarehouseEnv(grid_size=grid_size, n_agents=n_agents, n_humans=n_humans, human_grid_size=human_grid_size, num_shelves=num_shelves, 
                         num_pickup_points=num_pickup_points, num_dropoff_points=num_dropoff_points, render_mode=render_mode)
     # env = wrappers.CaptureStdoutWrapper(env)
     return env
