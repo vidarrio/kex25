@@ -15,7 +15,7 @@ class AStarAgent:
     Uses centralized planning and decentralized execution.
     """
 
-    def __init__(self, env, debug_level=1):
+    def __init__(self, env, debug_level=1, global_deadlock_threshold=5, local_deadlock_threshold=3):
         """Initialize A* agent with the warehouse environment."""
         self.env = env
 
@@ -27,7 +27,11 @@ class AStarAgent:
         self.need_replanning = {}
         # Deadlock detection
         self.consecutive_waits = {agent: 0 for agent in self.env.agents}
-        self.deadlock_threshold = 5  # Max consecutive waits before triggering deadlock
+        self.global_deadlock_threshold = global_deadlock_threshold  # Max global waits before triggering deadlock (any position)
+        self.local_deadlock_threshold = local_deadlock_threshold  # Max local waits before triggering replanning (specific position)
+        # Position history for oscillation detection
+        self.position_history = {agent: [] for agent in self.env.agents}
+        self.oscillation_detection_threshold = 6  # Need at least 6 positions to detect oscillation of length 2
 
         # Debug level
         self.debug_level = debug_level
@@ -79,24 +83,9 @@ class AStarAgent:
         # Debug
         self.debug(DEBUG_CRITICAL, "\n===== Planning Paths =====")
 
-        # Plan path for agents in priority order
-        priority_order = []
-
-        # Agents that are at their goals
-        for agent in self.env.agents:
-            if self.env.agent_positions[agent] == self.env.agent_goals[agent]:
-                priority_order.append(agent)
-
-        # Carrying agents
-        for agent in self.env.agents:
-            if self.env.agent_carrying[agent]:
-                priority_order.append(agent)
-
-        # The rest of the agents
-        for agent in self.env.agents:
-            if agent not in priority_order:
-                priority_order.append(agent)
-
+        # Get planning priority order
+        priority_order = self.get_priority_order()
+        
         # Plan paths for each agent in priority order
         for agent in priority_order:
             # Get agent's current position, goal, and carrying status
@@ -137,17 +126,16 @@ class AStarAgent:
                 # Reserve space-time points for this agent's path
                 time_step = 0
                 for pos_r, pos_c, action in path:
-                    # Only reserve MOVEMENT and PICKUP/DROPOFF actions (not wait)
-                    # AND limit how far ahead we reserve to prevent deadlocks
+                    # Reserve space-time points up to a maximum reservation horizon
                     max_reservation_horizon = 15
                     if time_step < max_reservation_horizon:
-                        if action < 6:  # Actions 0-5 (movement, pickup, dropoff)
-                            reservations[(pos_r, pos_c, time_step)] = agent
+                        reservations[(pos_r, pos_c, time_step)] = agent
                         
-                        # For wait actions, only reserve the NEXT wait position
-                        # This prevents deadlocks while still avoiding immediate collisions
-                        elif action == 6 and time_step == 0:
-                            reservations[(pos_r, pos_c, time_step)] = agent
+                        # For the last position, reserve it for all future time steps
+                        # to prevent other agents from moving there
+                        if time_step == len(path) - 1:
+                            for future_time in range(time_step + 1, max_reservation_horizon):
+                                reservations[(pos_r, pos_c, future_time)] = agent
                     time_step += 1
             else:
                 # If no path found, agent will wait
@@ -168,7 +156,7 @@ class AStarAgent:
                 # Track consecutive waits for deadlock detection
                 if action == 6:  # Wait action
                     self.consecutive_waits[agent] += 1
-                    if self.consecutive_waits[agent] >= self.deadlock_threshold:
+                    if self.consecutive_waits[agent] >= self.global_deadlock_threshold:
                         self.debug(DEBUG_CRITICAL, f"Deadlock detected for agent {agent}, has waited for {self.consecutive_waits[agent]} steps!")
                         self.need_replanning[agent] = True
                         self.consecutive_waits[agent] = 0
@@ -200,6 +188,32 @@ class AStarAgent:
             
         # Return the actions
         return actions
+    
+    def get_priority_order(self):
+        """
+        Get the priority order of agents based on their current state.
+        
+        Returns:
+            List of agents in priority order
+        """
+        priority_order = []
+
+        # Carrying agents first
+        for agent in self.env.agents:
+            if self.env.agent_carrying[agent]:
+                priority_order.append(agent)
+
+        # Agents not at their goals
+        for agent in self.env.agents:
+            if agent not in priority_order and self.env.agent_positions[agent] != self.env.agent_goals[agent]:
+                priority_order.append(agent)
+
+        # Lastly, agents at their goals
+        for agent in self.env.agents:
+            if agent not in priority_order:
+                priority_order.append(agent)
+
+        return priority_order
 
     def _compute_path(self, start, goal, obstacle_map, reservations, agent):
         """
@@ -375,6 +389,211 @@ class AStarAgent:
         if explored_nodes >= max_explored:
             self.debug(DEBUG_INFO, f"  Path search exceeded max exploration limit for {agent}")
         return None
+    
+    def detect_and_handle_local_conflicts(self, observations):
+        """
+        Use local observations to detect and handle:
+        1. Dynamic obstacles (humans)
+        2. Other agents (collisions)
+        3. Static obstacles (shelves)
+
+        Returns:
+            modified (boold): True if any paths were modified
+        """
+
+        modified = False
+
+        for agent, observation in observations.items():
+            # If agent has no path or is at the end of its path, skip
+            if agent not in self.paths or self.path_indices[agent] >= len(self.paths[agent]):
+                continue
+
+            # Get current position and planned next position
+            current_pos = self.env.agent_positions[agent]
+            next_idx = self.path_indices[agent]
+
+            # Track if this agent encountered a conflict this iteration
+            conflict_detected = False
+
+            # Get the next position and action from the path
+            if next_idx < len(self.paths[agent]):
+                next_r, next_c, action = self.paths[agent][next_idx]
+
+                # Only check movement actions (0-3)
+                if action in [0, 1, 2, 3]:
+                    # Convert global planned position to local observation coordinates
+                    local_r = next_r - current_pos[0] + 2 # +2 because observations are centered around the agent
+                    local_c = next_c - current_pos[1] + 2
+
+                    # Ensure coordinates are within local observation
+                    if 0 <= local_r < 5 and 0 <= local_c < 5:
+                        
+                        # Check all relevant obstacle channels
+                        
+                        # Channel 1: other agents
+                        other_agent = observation[1][local_r, local_c] == 1
+                        
+                        # Channel 2: static obstacles
+                        static_obstacle = observation[2][local_r, local_c] == 1
+
+                        # Channel 3: dynamic obstacles
+                        dynamic_obstacle = observation[3][local_r, local_c] == 1
+
+                        if other_agent or static_obstacle or dynamic_obstacle:
+                            # Conflict detected
+                            conflict_detected = True
+                            obstacle_type = "robot" if other_agent else "shelf" if static_obstacle else "human"
+                            self.debug(DEBUG_INFO, f"Agent {agent} detected {obstacle_type} at {next_r, next_c}")
+                            
+                            # If a conflict is detected, modify the path
+                            alternative_action = self._find_local_alternative(agent, observation, action)
+
+                            if alternative_action is not None and alternative_action != 6:
+                                # Apply the alternative movement action
+                                alt_delta = self.action_to_delta[alternative_action]
+                                dr, dc = alt_delta
+                                alt_r, alt_c = current_pos[0] + dr, current_pos[1] + dc
+
+                                # Update the path with the alternative action
+                                self.paths[agent][next_idx] = (alt_r, alt_c, alternative_action)
+                                self.debug(DEBUG_INFO, f"Agent {agent} modified path to alternative action {alternative_action}")
+                                modified = True
+                            else:
+                                # If no alternative action is found, wait
+                                self.paths[agent].insert(next_idx, (current_pos[0], current_pos[1], 6))  # Wait action
+                                self.debug(DEBUG_INFO, f"Agent {agent} has no alternative, waiting")
+                                modified = True
+
+                                # Track consecutive waits at this position
+                                if not hasattr(self, "position_wait_counts"):
+                                    self.position_wait_counts = {a: {} for a in self.env.agents}
+
+                                pos_key = (current_pos[0], current_pos[1])
+                                if pos_key not in self.position_wait_counts[agent]:
+                                    self.position_wait_counts[agent][pos_key] = 0
+
+                                self.position_wait_counts[agent][pos_key] += 1
+
+                                # If waited too long in the same position, trigger replanning
+                                if self.position_wait_counts[agent][pos_key] >= self.local_deadlock_threshold:
+                                    self.debug(DEBUG_CRITICAL, f"Agent {agent} has waited too long at {current_pos}, triggering replanning")
+                                    self.need_replanning[agent] = True
+                                    self.position_wait_counts[agent][pos_key] = 0
+
+                        else:
+                            # Clear wait count if no conflict
+                            if hasattr(self, "position_wait_counts") and agent in self.position_wait_counts:
+                                pos_key = (current_pos[0], current_pos[1])
+                                if pos_key in self.position_wait_counts[agent]:
+                                    self.position_wait_counts[agent][pos_key] = 0
+            
+
+            # If agent had conflict or is already in an oscillation pattern, check for oscillation
+            if conflict_detected or len(self.position_history[agent]) >= 2:
+                # Record the current position for oscillation detection
+                current_pos = self.env.agent_positions[agent]
+                self.position_history[agent].append(current_pos)
+
+                # Limit history size
+                if len(self.position_history[agent]) > self.oscillation_detection_threshold:
+                    self.position_history[agent].pop(0)
+
+                # Check for oscillation patterns
+                if len(self.position_history[agent]) >= 4: #  Need at least 4 positions to detect oscillation of length 2
+                    # Check for ABAB pattern
+                    pattern_length = 2
+                    if self._detect_oscillation(self.position_history[agent], pattern_length):
+                        self.debug(DEBUG_CRITICAL, f"Agent {agent} detected oscillation pattern, triggering replanning")
+                        self.need_replanning[agent] = True
+                        self.position_history[agent] = [] # Reset history after detecting oscillation
+                        modified = True
+
+        return modified
+    
+    def _detect_oscillation(self, history, pattern_length):
+        """
+        Detect oscillation patterns in the position history.
+        
+        Args:
+            history: List of positions
+            pattern_length: Length of the oscillation pattern to detect
+        Returns:
+            True if oscillation detected, False otherwise
+        """
+
+        if len(history) < pattern_length * 2:
+            return False
+        
+        # Check if the last n positions match the previous n positions
+        for i in range(pattern_length):
+            if history[-(i + 1)] != history[-(i + 1 + pattern_length)]:
+                return False
+            
+        return True
+
+    def _find_local_alternative(self, agent, observation, blocked_action):
+        """
+        Find an alternative action for the agent based on the local observation.
+        
+        Args:
+            agent: Agent ID
+            observation: Local observation of the agent
+            blocked_action: Action that is blocked
+        
+        Returns:
+            Alternative action or wait if no alternative is found
+        """
+
+        # Get agent's current position and goal
+        current_pos = self.env.agent_positions[agent]
+        goal = self.env.agent_goals[agent]
+
+        # Calculate current manhattan distance to goal
+        current_distance = self._heuristic(current_pos, goal)
+
+        # Evaluate all possible directions
+        possible_actions = []
+
+        for action in range(4):  # Only movement actions (0-3)
+            if action == blocked_action:
+                continue # Skip the blocked action
+
+            # Get the delta for this action
+            delta = self.action_to_delta[action]
+            dr, dc = delta
+
+            # Convert to local observation coordinates
+            local_r = 2 + dr
+            local_c = 2 + dc
+
+            # Check if this position is within bounds
+            if 0 <= local_r < 5 and 0 <= local_c < 5:
+                # Check if this position is free (no agents, shelves, or humans)
+                if (observation[1][local_r, local_c] == 0 and
+                    observation[2][local_r, local_c] == 0 and
+                    observation[3][local_r, local_c] == 0):
+                    
+                    # Calculate new position and distance to goal
+                    new_r = current_pos[0] + dr
+                    new_c = current_pos[1] + dc
+                    new_distance = self._heuristic((new_r, new_c), goal)
+
+                    # Calculate score: lower distance is better, negative score means we're moving away from the goal
+                    score = current_distance - new_distance
+
+                    possible_actions.append((action, score))
+
+        # If there are possible actions
+        if possible_actions:
+            # Sort by score (higher is better)
+            possible_actions.sort(key=lambda x: x[1], reverse=True)
+
+            # Return the best action
+            return possible_actions[0][0]
+
+        # If no alternatives found, return wait action
+        self.debug(DEBUG_INFO, f"Agent {agent} has no alternatives, waiting")
+        return 6  # Wait action
 
     def handle_post_action_state(self, actions):
         """
@@ -387,12 +606,22 @@ class AStarAgent:
             # After executing a dropoff action, force immediate replanning
             if action == 5: # Dropoff action
                 self.debug(DEBUG_CRITICAL, f"Agent {agent} executed dropoff action, forcing replanning")
+                
+                # Reset consecutive waits to prevent false deadlock detection
+                self.consecutive_waits[agent] = 0
+
+                # Mark this agent for replanning
                 self.need_replanning[agent] = True
                 result = True
 
             # After executing a pickup action, force immediate replanning
             elif action == 4: # Pickup action
                 self.debug(DEBUG_CRITICAL, f"Agent {agent} executed pickup action, forcing replanning")
+                
+                # Reset consecutive waits to prevent false deadlock detection
+                self.consecutive_waits[agent] = 0
+
+                # Mark this agent for replanning
                 self.need_replanning[agent] = True
                 result = True
 
@@ -403,6 +632,9 @@ class AStarAgent:
         Calculate cost for waiting based on consecutive wait count.
         """
 
+        # Get the current cost for this node or default to 0
+        current_cost = g_score.get(current, 0)
+
         if current in came_from and came_from[current][1] == 6:
             # Calculate how many times we've been waiting already
             consecutive_waits = 1
@@ -412,14 +644,15 @@ class AStarAgent:
                 temp_node = came_from[temp_node][0]
             
             # Exponential backoff for waiting
-            wait_cost = 1.0 + (2 ** consecutive_waits) - 1
-            # Long waits
+            wait_cost = current_cost + 1.0 + (1.5 ** consecutive_waits)
+
+            # Log long waits
             if consecutive_waits > 5:
                 self.debug(DEBUG_INFO, f"Agent {agent} has been waiting for {consecutive_waits} steps!")
             return wait_cost, consecutive_waits
         else:
             # Standard wait cost
-            return 1.5, 0
+            return current_cost + 2.0, 0
 
     def _reconstruct_path(self, came_from, current):
         """
@@ -478,6 +711,12 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
 
     # Run the simulation
     for step in range(n_steps):
+        # Use local observations to detect and handle conflicts
+        local_adjustments = a_star_agent.detect_and_handle_local_conflicts(observations)
+
+        if local_adjustments:
+            a_star_agent.debug(DEBUG_INFO, "Local adjustments made to paths")
+
         # Get actions from A* agent
         actions = a_star_agent.get_actions()
         
@@ -510,7 +749,7 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
         a_star_agent.debug(DEBUG_INFO, f"Completed tasks: {env.completed_tasks}")
         
         # Slow down simulation
-        time.sleep(0.3)
+        #time.sleep(0.3)
         
         # Check for replanning
         replan = any(a_star_agent.need_replanning.values())

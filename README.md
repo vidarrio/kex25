@@ -105,6 +105,77 @@ The A* algorithm is a pathfinding algorithm that is used to find the shortest pa
 
 It is implemented in the [a_star.py](src/algorithms/a_star.py) file.
 
+### Core algorithm structure
+
+**1. Centralized global planning**
+
+* 3D reservation system (x, y, time) prevents collisions
+* Priority based planning (carrying agents first, then non-goal agents)
+* Manhattan distance heuristic for path cost estimation
+
+**2. Decentralized execution**
+
+* Local observation-based conflict resolution
+* Reactive path adjustments during execution
+* Local alternative finding when obstacles appear
+
+### Path planning components
+
+**1. Space-time reservations**
+
+* 3D reservation system (x, y, time) prevents collisions
+* Maximum reservation horizon of 15 time steps
+* Final positions reserved for all future time steps
+
+**2. Path Cost Calculation**
+
+* Movement cost: 1 per time step
+* Wait cost: 2.0 (higher to encourage movement)
+* Exponential backoff for consecutive waits: current_cost + 1 + 1.5<sup>(wait_count)</sup>
+
+**3. Priority plannign**
+
+* Agents carrying items get highest priority
+* Agents not at goals get medium priority
+* Agents at goals get lowest priority
+
+### Conflict Detection and Resolution
+**1. Local Observation Window**
+
+* 5x5 grid centered on each agent
+* Detects three types of obstacles:
+  * Other agents (channel 1)
+  * Static obstacles / shelves (channel 2)
+  * Dynamic obstacles / humans (channel 3)
+
+**2. Alternative Path Finding**
+
+* Evaluates all movement actions except blocked ones
+* Scores alternatives based on distance to goal
+* Chooses the best alternative based on the score (lower is better)
+
+**3. Position-Specific Wait Tracking**
+
+* Tracks consecutive waits at specific positions
+* Triggers replanning if wait count exceeds local deadlock threshold (default: 3)
+
+### Deadlock Detection
+**1. Position-Based Deadlock Detection**
+
+* Tracks waits at specific positions
+* Triggers replanning if wait count exceeds local deadlock threshold (default: 3)
+
+**2. Global Deadlock Detection**
+
+* Tracks consecutive wait actions regardless of position
+* Triggers replanning if wait count exceeds global deadlock threshold (default: 5)
+
+**3. Oscilation Detection**
+
+* Tracks position history up to oscillation detection threshold (default: 6)
+* Identifies repetetive position patterns (ABAB)
+* Detects minimum pattern length of 2
+
 ### Reinforcement Learning Algorithm
 The reinforcement learning algorithm is a model-free machine learning algorithm that learns to make decisions by interacting with the environment. The algorithm learns a policy that maps states to actions by maximizing the expected cumulative reward. The algorithm uses a neural network to approximate the Q-function, which estimates the expected cumulative reward of taking an action in a given state.
 
