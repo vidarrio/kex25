@@ -32,7 +32,7 @@ class SimpleHumanPlanner:
             # Check if we're in a cycle (same position visited multiple times)
             if self._is_in_cycle(human, current):
                 # Break the cycle by assigning a new random goal
-                print(f"Human {human} detected in a cycle. Assigning new goal.")
+                # print(f"Human {human} detected in a cycle. Assigning new goal.")
                 assign_new_human_goal(human, human_goals, grid, grid_size)
                 goal = human_goals[human]
                 # Clear the position history to start fresh

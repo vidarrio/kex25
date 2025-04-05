@@ -16,13 +16,14 @@ class WarehouseEnv(ParallelEnv):
     metadata = {'render_modes': ['human', 'rgb_array'], 'name': 'warehouse_v0'}
 
     def __init__(self, grid_size=(20, 20), human_grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, 
-                 num_pickup_points=3, num_dropoff_points=2, collision_penalty=-2, task_reward=10, step_cost=-0.1, 
-                 render_mode=None):
+                 num_pickup_points=3, num_dropoff_points=2, collision_penalty=-2, task_reward=10, step_cost=-0.1,
+                 observation_size=(5, 5), render_mode=None):
         super().__init__()
 
         # Environment parameters
         self.grid_size = grid_size
         self.human_grid_size = human_grid_size
+        self.observation_size = observation_size
         self.n_agents = n_agents
         self.n_humans = n_humans
         self.num_shelves = num_shelves
@@ -77,8 +78,7 @@ class WarehouseEnv(ParallelEnv):
         9. Valid pickup/drop indicator (1 if agent is at a valid pickup/drop point, 0 otherwise)
         """
 
-        local_obs_size = (5, 5) # 5x5 grid around the agent
-        obs_shape = (9,) + local_obs_size
+        obs_shape = (9,) + self.local_observation_size
         return spaces.Box(low=0, high=1, shape=obs_shape, dtype=np.float32)
 
     def reset(self, seed=None, options=None):
@@ -246,12 +246,6 @@ class WarehouseEnv(ParallelEnv):
                 self.human_positions[human] = new_pos
                 # Mark new position in grid
                 self.grid[new_pos] = 3  # Human
-
-        # Fourth pass: Handle human pickup/dropoff/wait actions
-        for human in self.humans:
-            human_action = human_actions[human]
-            current_pos = self.human_positions[human]
-            self._fourth_pass(human, human_action, current_pos, rewards)
 
         # Process agents
 
@@ -962,6 +956,8 @@ class WarehouseEnv(ParallelEnv):
         # Handle wait action (6)
         elif action == 6:
             # No action taken, just wait
+            # Add a small penalty for waiting
+            rewards[agent] += 2 * self.step_cost
             pass
 
 def second_pass(entities_order, current_positions, new_positions, actions, all_entities, reserved_positions, allow_overlap=False):
