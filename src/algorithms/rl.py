@@ -111,12 +111,19 @@ class ReplayBuffer:
 
         experiences = random.sample(self.memory, k=self.batch_size)
 
-        # Convert to torch tensors
-        states = torch.from_numpy(np.stack([e.state for e in experiences])).float().to(device)
-        actions = torch.from_numpy(np.vstack([e.action for e in experiences])).long().to(device)
-        rewards = torch.from_numpy(np.vstack([e.reward for e in experiences])).float().to(device)
-        next_states = torch.from_numpy(np.stack([e.next_state for e in experiences])).float().to(device)
-        dones = torch.from_numpy(np.vstack([e.done for e in experiences]).astype(np.uint8)).float().to(device)
+        # Process all states together before transferring to GPU
+        states = np.stack([e.state for e in experiences])
+        actions = np.vstack([e.action for e in experiences])
+        rewards = np.vstack([e.reward for e in experiences])
+        next_states = np.stack([e.next_state for e in experiences])
+        dones = np.vstack([e.done for e in experiences]).astype(np.uint8)
+
+        # Single transfer to GPU
+        states = torch.FloatTensor(states).to(device)
+        actions = torch.LongTensor(actions).to(device)
+        rewards = torch.FloatTensor(rewards).to(device)
+        next_states = torch.FloatTensor(next_states).to(device)
+        dones = torch.FloatTensor(dones).to(device)
 
         return states, actions, rewards, next_states, dones
     
@@ -136,7 +143,7 @@ class QLAgent:
 
     def __init__(self, env, debug_level=DEBUG_NONE,
                  alpha=0.01, gamma=0.99, epsilon_start=1.0, epsilon_end=0.1,
-                 epsilon_decay=0.995, hidden_size=64, buffer_size=10000, batch_size=128,
+                 epsilon_decay=0.995, hidden_size=64, buffer_size=10000, batch_size=256,
                  update_freq=16, tau=0.001):
         """
         Initialize the Q-learning agent.
