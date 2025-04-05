@@ -3,7 +3,7 @@ from environment import env
 from algorithms import run_a_star, run_q_learning, train_DQN
 import os
 
-CURRENT_VERSION = "v1.0.0"
+CURRENT_VERSION = "v1.2.1"
 
 # Construct path to the model directory
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -22,7 +22,9 @@ def eval_DQN():
 
 
 def train_DQL():
-    # Create warehouse environment with rendering
+    # Create warehouse environments with rendering
+    simplest_env = env(grid_size=(5, 5), n_agents=1, n_humans=0, num_shelves=0, num_pickup_points=1,
+                        num_dropoff_points=1, render_mode="human")
     warehouse_env = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=6, n_humans=10, num_shelves=2048, num_pickup_points=3,
                         num_dropoff_points=2, render_mode="human")
 
@@ -31,14 +33,32 @@ def train_DQL():
 
 def test_a_star():
     # Create warehouse environment with rendering
+    simplest_env = env(grid_size=(5, 5), n_agents=1, n_humans=0, num_shelves=0, num_pickup_points=1,
+                        num_dropoff_points=1, render_mode="human")
     warehouse_env = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=6, n_humans=10, num_shelves=2048, num_pickup_points=3,
                         num_dropoff_points=2, render_mode="human")
 
-    run_a_star(warehouse_env, n_steps=1000)
+    # run_a_star(simplest_env, n_steps=1000, debug_level=5)
+    run_a_star(warehouse_env, n_steps=1000, debug_level=5)
+
+# Take first argument as task ("a_star" or "dqn_train" or "dqn_eval")
+def main(task):
+    if task == "a_star":
+        test_a_star()
+    elif task == "dqn_train":
+        train_DQL()
+    elif task == "dqn_eval":
+        eval_DQN()
+    else:
+        raise ValueError("Invalid task. Choose 'a_star', 'dqn_train', or 'dqn_eval'.")
+    
 
 if __name__ == "__main__":
-    # test_a_star()
-
-    train_DQL()
-
-    # eval_DQN()
+    import sys
+    if len(sys.argv) != 2:
+        print("Usage: python main.py <task>")
+        print("Tasks: a_star, dqn_train, dqn_eval")
+        sys.exit(1)
+    
+    task = sys.argv[1]
+    main(task)

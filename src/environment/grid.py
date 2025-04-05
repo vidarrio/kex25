@@ -16,7 +16,7 @@ class WarehouseEnv(ParallelEnv):
     metadata = {'render_modes': ['human', 'rgb_array'], 'name': 'warehouse_v0'}
 
     def __init__(self, grid_size=(20, 20), human_grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, 
-                 num_pickup_points=3, num_dropoff_points=2, collision_penalty=-2, task_reward=10, step_cost=-0.1,
+                 num_pickup_points=3, num_dropoff_points=2, collision_penalty=-2, task_reward=50, step_cost=-0.1,
                  observation_size=(5, 5), render_mode=None):
         super().__init__()
 
@@ -36,6 +36,9 @@ class WarehouseEnv(ParallelEnv):
 
         # Create list of possible agents
         self.possible_agents = ["agent_" + str(i) for i in range(self.n_agents)]
+
+        # Hold every agents previous position
+        self.previous_positions = {agent: None for agent in self.possible_agents}
         
         # Create list of possible humans
         self.possible_humans = ["human_" + str(i) for i in range(self.n_humans)]
@@ -319,6 +322,10 @@ class WarehouseEnv(ParallelEnv):
         # Truncations are artificial endings (e.g. max steps reached)
         terminations["__all__"] = False
         truncations["__all__"] = False
+
+        # Update previous positions for all agents
+        for agent in self.agents:
+            self.previous_positions[agent] = self.agent_positions[agent]
 
         # Create observations
         observations = {agent: self._get_observation(agent) for agent in self.agents}
@@ -912,6 +919,17 @@ class WarehouseEnv(ParallelEnv):
             
     def _fourth_pass(self, agent, action, current_pos, rewards):
 
+        # Distance to goal
+        goal = self.agent_goals[agent]
+        prev_pos = self.previous_positions[agent]
+
+        # Reward for moving closer to goal
+        if prev_pos != None:
+            prev_dist = abs(prev_pos[0] - goal[0]) + abs(prev_pos[1] - goal[1])
+            curr_dist = abs(current_pos[0] - goal[0]) + abs(current_pos[1] - goal[1])
+            if curr_dist < prev_dist:
+                rewards[agent] += 1
+
         # Handle pickup action (4)
         if action == 4:
             # Check if agent is at a pickup point and not carrying an item
@@ -920,7 +938,7 @@ class WarehouseEnv(ParallelEnv):
                 if current_pos == self.agent_goals[agent]:
                     # Agent can pick up item
                     self.agent_carrying[agent] = True
-                    rewards[agent] += self.task_reward / 2  # Reward for picking up an item
+                    rewards[agent] += self.task_reward  # Reward for picking up an item
 
                     # Remember which item type was picked up
                     pickup_idx = self.pickup_points.index(current_pos)
@@ -942,7 +960,7 @@ class WarehouseEnv(ParallelEnv):
                 if current_pos == self.agent_goals[agent]:
                     # Agent can drop off item
                     self.agent_carrying[agent] = False
-                    rewards[agent] += self.task_reward / 2  # Reward for dropping off an item
+                    rewards[agent] += self.task_reward  # Reward for dropping off an item
 
                     # Increment completed tasks
                     self.completed_tasks[agent] += 1

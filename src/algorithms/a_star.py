@@ -709,6 +709,9 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
     a_star_agent.debug(DEBUG_CRITICAL, "\nInitial planning...")
     a_star_agent.plan_all_paths()
 
+    # Cumulative rewards tracking
+    cumulative_rewards = {agent: 0 for agent in env.agents}
+
     # Run the simulation
     for step in range(n_steps):
         # Use local observations to detect and handle conflicts
@@ -722,6 +725,11 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
         
         # Step the environment
         observations, rewards, terminations, truncations, infos = env.step(actions)
+
+        # Update cumulative rewards
+        for agent in env.agents:
+            if agent in cumulative_rewards:
+                cumulative_rewards[agent] += rewards[agent]
 
         # Check if any pickup/dropoff actions were performed
         if a_star_agent.handle_post_action_state(actions):
@@ -742,7 +750,7 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
                     a_star_agent.debug(DEBUG_CRITICAL, f"{agent} has reached its goal!")
         
         # Render the environment
-        env.render()
+        # env.render()
         
         # Print info
         a_star_agent.debug(DEBUG_INFO, f"Rewards: {rewards}")
@@ -760,6 +768,13 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
         # Break if all agents are done
         if terminations["__all__"]:
             break
+
+    # Print total delievered tasks
+    total_delivered = sum(env.completed_tasks.values())
+    a_star_agent.debug(DEBUG_SPECIFIC, f"\nTotal delivered tasks: {total_delivered}")
+    # Print total scores
+    total_score = sum(cumulative_rewards.values())
+    a_star_agent.debug(DEBUG_SPECIFIC, f"Total scores: {total_score}")
             
     # Close the environment
     env.close()
