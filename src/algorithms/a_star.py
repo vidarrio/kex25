@@ -81,7 +81,7 @@ class AStarAgent:
         reservations = {}
 
         # Debug
-        self.debug(DEBUG_CRITICAL, "\n===== Planning Paths =====")
+        self.debug(DEBUG_INFO, "\n===== Planning Paths =====")
 
         # Get planning priority order
         priority_order = self.get_priority_order()
@@ -476,7 +476,7 @@ class AStarAgent:
 
                                 # If waited too long in the same position, trigger replanning
                                 if self.position_wait_counts[agent][pos_key] >= self.local_deadlock_threshold:
-                                    self.debug(DEBUG_CRITICAL, f"Agent {agent} has waited too long at {current_pos}, triggering replanning")
+                                    self.debug(DEBUG_INFO, f"Agent {agent} has waited too long at {current_pos}, triggering replanning")
                                     self.need_replanning[agent] = True
                                     self.position_wait_counts[agent][pos_key] = 0
 
@@ -503,7 +503,7 @@ class AStarAgent:
                     # Check for ABAB pattern
                     pattern_length = 2
                     if self._detect_oscillation(self.position_history[agent], pattern_length):
-                        self.debug(DEBUG_CRITICAL, f"Agent {agent} detected oscillation pattern, triggering replanning")
+                        self.debug(DEBUG_INFO, f"Agent {agent} detected oscillation pattern, triggering replanning")
                         self.need_replanning[agent] = True
                         self.position_history[agent] = [] # Reset history after detecting oscillation
                         modified = True
@@ -605,7 +605,7 @@ class AStarAgent:
         for agent, action in actions.items():
             # After executing a dropoff action, force immediate replanning
             if action == 5: # Dropoff action
-                self.debug(DEBUG_CRITICAL, f"Agent {agent} executed dropoff action, forcing replanning")
+                self.debug(DEBUG_INFO, f"Agent {agent} executed dropoff action, forcing replanning")
                 
                 # Reset consecutive waits to prevent false deadlock detection
                 self.consecutive_waits[agent] = 0
@@ -616,7 +616,7 @@ class AStarAgent:
 
             # After executing a pickup action, force immediate replanning
             elif action == 4: # Pickup action
-                self.debug(DEBUG_CRITICAL, f"Agent {agent} executed pickup action, forcing replanning")
+                self.debug(DEBUG_INFO, f"Agent {agent} executed pickup action, forcing replanning")
                 
                 # Reset consecutive waits to prevent false deadlock detection
                 self.consecutive_waits[agent] = 0
@@ -733,7 +733,7 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
 
         # Check if any pickup/dropoff actions were performed
         if a_star_agent.handle_post_action_state(actions):
-            a_star_agent.debug(DEBUG_CRITICAL, "Replanning after pickup/dropoff...")
+            a_star_agent.debug(DEBUG_INFO, "Replanning after pickup/dropoff...")
             a_star_agent.plan_all_paths()
         
         # Print positions vs goals
@@ -747,7 +747,7 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
             # Check if agent has reached goal
             if pos == goal:
                 if (not carrying and goal in env.pickup_points) or (carrying and goal in env.dropoff_points):
-                    a_star_agent.debug(DEBUG_CRITICAL, f"{agent} has reached its goal!")
+                    a_star_agent.debug(DEBUG_INFO, f"{agent} has reached its goal!")
         
         # Render the environment
         # env.render()
@@ -762,7 +762,7 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
         # Check for replanning
         replan = any(a_star_agent.need_replanning.values())
         if replan:
-            a_star_agent.debug(DEBUG_CRITICAL, "\nReplanning paths...")
+            a_star_agent.debug(DEBUG_INFO, "\nReplanning paths...")
             a_star_agent.plan_all_paths()
             
         # Break if all agents are done
@@ -778,3 +778,6 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
             
     # Close the environment
     env.close()
+
+    # Return total completed tasks
+    return total_delivered

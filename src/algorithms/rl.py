@@ -8,6 +8,8 @@ from collections import namedtuple, deque
 from subprocess import call
 import time
 from torch.cuda.amp import autocast
+from environment import env
+from algorithms import run_a_star
 
 # Debug levels
 DEBUG_NONE = 0
@@ -108,7 +110,7 @@ class ReplayBuffer:
         # Prioritize successful experiences
         if reward > 10.0: # task completion
             # Add experience multiple times
-            for _ in range(10):
+            for _ in range(3):
                 self.memory.append(e)
         else:
             # Add experience once
@@ -128,12 +130,13 @@ class ReplayBuffer:
         next_states = np.stack([e.next_state for e in experiences])
         dones = np.vstack([e.done for e in experiences]).astype(np.uint8)
 
-        # Single transfer to GPU
-        states = torch.FloatTensor(states).to(device)
-        actions = torch.LongTensor(actions).to(device)
-        rewards = torch.FloatTensor(rewards).to(device)
-        next_states = torch.FloatTensor(next_states).to(device)
-        dones = torch.FloatTensor(dones).to(device)
+        # Single transfer to GPU using pinned memory
+        states = torch.from_numpy(states).pin_memory().to(device, non_blocking=True)
+        actions = torch.from_numpy(actions).long().pin_memory().to(device, non_blocking=True)
+        rewards = torch.from_numpy(rewards).float().pin_memory().to(device, non_blocking=True)
+        next_states = torch.from_numpy(next_states).pin_memory().to(device, non_blocking=True)
+        dones = torch.from_numpy(dones).float().pin_memory().to(device, non_blocking=True)
+
 
         return states, actions, rewards, next_states, dones
     
@@ -153,8 +156,8 @@ class QLAgent:
 
     def __init__(self, env, debug_level=DEBUG_NONE,
                  alpha=0.001, gamma=0.99, epsilon_start=1.0, epsilon_end=0.1,
-                 epsilon_decay=0.98, hidden_size=64, buffer_size=50000, batch_size=256,
-                 update_freq=8, tau=0.001):
+                 epsilon_decay=0.99, hidden_size=64, buffer_size=20000, batch_size=64,
+                 update_freq=8, tau=0.005):
         """
         Initialize the Q-learning agent.
 
@@ -178,7 +181,7 @@ class QLAgent:
 
         # Get observation shape from environment
         observation_shape = env.observation_size
-        observation_channels = 9
+        observation_channels = 10
 
         # State and action dimentions
         self.state_size = (observation_channels, *observation_shape)
@@ -228,7 +231,6 @@ class QLAgent:
         """
         Store experience to memory, sample from memory, and learn.
         """
-
         # Add experience to replay buffer for each agent
         for agent in self.env.agents:
             if agent in states and agent in next_state:
@@ -240,104 +242,185 @@ class QLAgent:
                     done[agent]
                 )
 
-        # Learn every update_freq steps
+        # Increment step counter
         self.t_step += 1
-        if self.t_step % self.update_freq == 0 and len(self.memory) >= self.batch_size:
-            # Sample a batch of experiences
+        
+        # Update model less often for multiple agents
+        update_freq = 4 if len(self.env.agents) == 1 else self.update_freq
+        
+        # Learn every update_freq steps
+        if self.t_step % update_freq == 0 and len(self.memory) >= self.batch_size:
             experiences = self.memory.sample()
-
-            # learn for each agent
-            for agent in self.env.agents:
-                self._learn(agent, experiences) 
+            agent = self.env.agents[self.t_step % len(self.env.agents)]
+            self._learn(agent, experiences)
 
     def select_action(self, state, agent, eval_mode=False):
-        """
-        Return action for given state using epsilon-greedy policy.
-        """
-
-        # Check if agent is at a pickup or dropoff point
-        is_at_pickup = state[5, 2, 2] > 0.5
-        is_at_dropoff = state[6, 2, 2] > 0.5
-        is_carrying = state[7, 2, 2] > 0.5
-
-        # When at goal states, reduce exploration
-        if eval_mode or self.epsilon < 0.3:
-            if is_at_pickup and not is_carrying:
-                return 4
-            elif is_at_dropoff and is_carrying:
-                return 5
-            
+        """Return action for given state using epsilon-greedy policy with proper masking."""
         
-        # Check if we should explore
+        # Early decision for pickup/dropoff at goal states
+        is_at_pickup = state[5, 2, 2] > 0.5  # Center cell is pickup
+        is_at_dropoff = state[6, 2, 2] > 0.5  # Center cell is dropoff
+        is_carrying = state[7, 2, 2] > 0.5
+        
+        # For explicit goal states, return deterministic action
+        if is_at_pickup and not is_carrying:
+            return 4  # pickup
+        if is_at_dropoff and is_carrying:
+            return 5  # dropoff
+        
+        # Boundary detection from state observation
+        # In the observation, channels 0-3 of cells outside bounds will be 0
+        at_left_edge = np.sum(state[2, 2, 0]) > 0  # Shelf or edge to the left
+        at_right_edge = np.sum(state[2, 2, 4]) > 0  # Shelf or edge to the right 
+        at_top_edge = np.sum(state[2, 0, 2]) > 0  # Shelf or edge above
+        at_bottom_edge = np.sum(state[2, 4, 2]) > 0  # Shelf or edge below
+        
+        # Create a mask for valid actions (1 for valid, 0 for invalid)
+        valid_action_mask = np.ones(7)
+        if at_left_edge:
+            valid_action_mask[0] = 0  # Block LEFT movement
+        if at_bottom_edge:
+            valid_action_mask[1] = 0  # Block DOWN movement
+        if at_right_edge:
+            valid_action_mask[2] = 0  # Block RIGHT movement
+        if at_top_edge:
+            valid_action_mask[3] = 0  # Block UP movement
+        
+        # Also mask pickup/dropoff if not at valid locations
+        if not is_at_pickup or is_carrying:
+            valid_action_mask[4] = 0
+        if not is_at_dropoff or not is_carrying:
+            valid_action_mask[5] = 0
+        
+        # Standard exploration/exploitation
         if not eval_mode and random.random() < self.epsilon:
-            # Explore: select random action
-            return random.randint(0, self.action_size - 1)
-
-        # Convert state to tensor
-        state_tensor = torch.from_numpy(state).float().unsqueeze(0).to(device)
-
+            # Find valid actions for exploration
+            valid_movement_actions = [a for a in range(4) if valid_action_mask[a] == 1]
+            if valid_movement_actions:
+                # Prefer movement actions with probability 0.9, wait with 0.1
+                if random.random() < 0.9:
+                    return random.choice(valid_movement_actions)
+                else:
+                    return 6  # Wait action
+            else:
+                # If no valid movement actions, wait
+                return 6
+        
+        # Get Q-values
         with torch.no_grad():
-            action_values = self.q_networks[agent](state_tensor)
-
-        # Exploit: select action with highest Q-value
-        return int(torch.argmax(action_values).item())
+            state_tensor = torch.from_numpy(state).float().unsqueeze(0).to(device)
+            q_values = self.q_networks[agent](state_tensor).cpu().numpy().flatten()
+        
+        # Apply the mask by setting invalid action values to negative infinity
+        masked_q_values = q_values.copy()
+        for a in range(7):
+            if valid_action_mask[a] == 0:
+                masked_q_values[a] = float('-inf')
+        
+        # If all actions are masked (extreme edge case), default to wait
+        if np.all(masked_q_values == float('-inf')):
+            return 6  # Wait
+        
+        return np.argmax(masked_q_values)
     
     def select_action_batch(self, observations):
         """
-        Select actions for all agents in a single batch.
+        Select actions for all agents in a single batch with proper action masking.
         """
-
         actions = {}
-        states = []
-        agents = []
-
-        # For each agent, check if we're on a pickup or dropoff point
-        # and if we are carrying an item
-        is_at_pickup = {}
-        is_at_dropoff = {}
-        is_carrying = {}
+        
+        # Prepare batch for network inference
+        batch_states = []
+        batch_agents = []
+        
+        # First, handle direct goal actions (pickup/dropoff) and exploration
         for agent in self.env.agents:
-            is_at_pickup[agent] = observations[agent][5, 2, 2] > 0.5
-            is_at_dropoff[agent] = observations[agent][6, 2, 2] > 0.5
-            is_carrying[agent] = observations[agent][7, 2, 2] > 0.5
-
-        # When at goal states, reduce exploration
-        for agent in self.env.agents:
-            if self.epsilon < 0.3:
-                if is_at_pickup[agent] and not is_carrying[agent]:
-                    actions[agent] = 4
-                elif is_at_dropoff[agent] and is_carrying[agent]:
-                    actions[agent] = 5
-
-        # Determine which agents need network evaluation vs random actions when agent is not in actions
-        for agent in self.env.agents:
-            # If agent already has an action, skip it
-            if agent in actions:
+            state = observations[agent]
+            is_at_pickup = state[5, 2, 2] > 0.5
+            is_at_dropoff = state[6, 2, 2] > 0.5
+            is_carrying = state[7, 2, 2] > 0.5
+            
+            # When at goal states use deterministic action
+            if is_at_pickup and not is_carrying:
+                actions[agent] = 4  # pickup
                 continue
-
-            # Check if exploring
+            elif is_at_dropoff and is_carrying:
+                actions[agent] = 5  # dropoff
+                continue
+            
+            # Boundary detection from state observation
+            # In the observation, channels 0-3 of cells outside bounds will be 0
+            at_left_edge = np.sum(state[2, 2, 0]) > 0  # Shelf or edge to the left
+            at_right_edge = np.sum(state[2, 2, 4]) > 0  # Shelf or edge to the right 
+            at_top_edge = np.sum(state[2, 0, 2]) > 0  # Shelf or edge above
+            at_bottom_edge = np.sum(state[2, 4, 2]) > 0  # Shelf or edge below
+            
+            # Create a mask for valid actions (1 for valid, 0 for invalid)
+            valid_action_mask = np.ones(7)
+            if at_left_edge:
+                valid_action_mask[0] = 0  # Block LEFT movement
+            if at_bottom_edge:
+                valid_action_mask[1] = 0  # Block DOWN movement
+            if at_right_edge:
+                valid_action_mask[2] = 0  # Block RIGHT movement
+            if at_top_edge:
+                valid_action_mask[3] = 0  # Block UP movement
+            
+            # Also mask pickup/dropoff if not at valid locations
+            if not is_at_pickup or is_carrying:
+                valid_action_mask[4] = 0
+            if not is_at_dropoff or not is_carrying:
+                valid_action_mask[5] = 0
+            
+            # For exploration
             if random.random() < self.epsilon:
-                # Explore: select random action
-                actions[agent] = random.randint(0, self.action_size - 1)
+                # Find valid actions for exploration
+                valid_movement_actions = [a for a in range(4) if valid_action_mask[a] == 1]
+                if valid_movement_actions:
+                    # Prefer movement actions with probability 0.9, wait with 0.1
+                    if random.random() < 0.9:
+                        actions[agent] = random.choice(valid_movement_actions)
+                    else:
+                        actions[agent] = 6  # Wait action
+                else:
+                    # If no valid movement actions, wait
+                    actions[agent] = 6
             else:
-                # Process state with network evaluation
-                agents.append(agent)
-                states.append(observations[agent])
-
-        # For any agents that need network evaluation
-        if states:
-            state_batch = torch.from_numpy(np.stack(states)).float().to(device)
-
+                # Need network evaluation
+                batch_agents.append(agent)
+                batch_states.append(state)
+                # Store the valid action mask for later use
+                if not hasattr(self, 'batch_action_masks'):
+                    self.batch_action_masks = {}
+                self.batch_action_masks[agent] = valid_action_mask
+        
+        # Only run network if we have agents needing evaluation
+        if batch_states:
+            # Convert to tensor and process in one batch
             with torch.no_grad():
-                # Forward pass
-                action_values = [self.q_networks[agent](state_batch[i:i+1]) for i, agent in enumerate(agents)]
-
-                # Select best action
-                for i, agent in enumerate(agents):
-                    actions[agent] = int(torch.argmax(action_values[i]).item())
-
+                state_batch = torch.from_numpy(np.stack(batch_states)).float().to(device)
+                # Process all states in a single batch
+                q_values_batch = self.q_networks[batch_agents[0]](state_batch)
+                
+                # Apply action masking to the q-values for all agents in batch
+                for i, agent in enumerate(batch_agents):
+                    q_values = q_values_batch[i].cpu().numpy()
+                    
+                    # Apply the mask by setting invalid action values to negative infinity
+                    masked_q_values = q_values.copy()
+                    valid_action_mask = self.batch_action_masks[agent]
+                    for a in range(7):
+                        if valid_action_mask[a] == 0:
+                            masked_q_values[a] = float('-inf')
+                    
+                    # If all actions are masked (extreme edge case), default to wait
+                    if np.all(masked_q_values == float('-inf')):
+                        actions[agent] = 6  # Wait
+                    else:
+                        # Get best valid action
+                        actions[agent] = np.argmax(masked_q_values)
+        
         return actions
-
 
         
     def update_epsilon(self):
@@ -384,15 +467,19 @@ class QLAgent:
         
         # Get Q-values from local and target networks - batch processing
         q_values = self.q_networks[agent](states).gather(1, actions)
+        
+        # Clip rewards for stability (-10 to +10 range)
+        rewards = torch.clamp(rewards, min=-10.0, max=10.0)
 
         # Only compute next_q_values if gamma > 0
         if self.gamma > 0:
             # Get Q-values from target network
             with torch.no_grad():
-# Get actions from current policy network
+                # Get actions from local network
                 next_actions = self.q_networks[agent](next_states).argmax(1, keepdim=True)
                 # Get Q-values from target network for those actions
                 next_q_values = self.target_networks[agent](next_states).gather(1, next_actions)
+                # Compute targets using Bellman equation
                 targets = rewards + (self.gamma * next_q_values * (1 - dones))
         else:
             # If gamma is 0, use rewards directly
@@ -428,7 +515,7 @@ def check_gpu_usage():
         print(f"Memory allocated: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
         print(f"Memory cached: {torch.cuda.memory_reserved(0) / 1e9:.2f} GB")
 
-def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, save_every=100, model_path=get_model_path()):
+def train_DQN(env, agent=None, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, save_every=100, model_path=get_model_path()):
     """
     Train Q-learning agent in the warehouse environment.
     
@@ -457,8 +544,14 @@ def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
         print(f"Using {num_threads} CPU threads for data loading.")
 
     # Initialize agent
-    ql_agent = QLAgent(env, debug_level=debug_level)
-
+    if agent is None:
+        # Create new agent if not provided
+        ql_agent = QLAgent(env, debug_level=debug_level)
+    else:
+        # Use provided agent
+        ql_agent = agent
+        ql_agent.env = env
+    
     # Track scores
     scores = []
 
@@ -467,6 +560,17 @@ def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
     total_agent_time = 0
     total_select_action_time = 0
     total_step_time = 0
+    
+    # In your training loop, add these to track stats:
+    deliveries_per_episode = []
+    last_10_deliveries = deque(maxlen=10)
+    
+    # Add early stopping variables
+    best_performance = -float('inf')
+    best_model_state = None
+    patience = 100  # Number of episodes to wait before early stopping
+    no_improvement = 0
+    best_episode = 0
     
     # Training loop
     for episode in range(1, n_episodes + 1):
@@ -523,8 +627,51 @@ def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
         ql_agent.episode_rewards.append(score)
         ql_agent.completed_tasks.append(env.completed_tasks)
 
-        # Log episode results
-        ql_agent.debug(DEBUG_CRITICAL, f"Episode {episode}/{n_episodes}, Score: {score}, Completed tasks: {env.completed_tasks}, Epsilon: {ql_agent.epsilon:.4f}")
+        # After each episode, add:
+        episode_deliveries = sum(env.completed_tasks.values())
+        deliveries_per_episode.append(episode_deliveries)
+        last_10_deliveries.append(episode_deliveries)
+    
+        # Print rolling stats every episode:
+        avg_deliveries = sum(last_10_deliveries) / len(last_10_deliveries) if last_10_deliveries else 0
+        ql_agent.debug(DEBUG_CRITICAL, 
+            f"Episode {episode:4}/{n_episodes:<4} | "
+            f"Score: {score:8.1f} | "
+            f"Deliveries: {episode_deliveries:3} | "
+            f"10-ep Avg: {avg_deliveries:5.1f} | "
+            f"Epsilon: {ql_agent.epsilon:.4f}")
+
+        # Early stopping check
+        if episode > 10:  # After we have enough data
+            # Compare to best performance so far
+            if avg_deliveries > best_performance:
+                best_performance = avg_deliveries
+                best_episode = episode
+                no_improvement = 0
+                
+                # Save best model state
+                best_model_state = {
+                    agent: ql_agent.q_networks[agent].state_dict().copy() 
+                    for agent in env.agents
+                }
+                
+                # Also save to disk
+                ql_agent.save_model(model_path.replace('.pth', '_best.pth'))
+                ql_agent.debug(DEBUG_INFO, f"New best model saved (episode {episode}, deliveries: {avg_deliveries:.1f})")
+            else:
+                no_improvement += 1
+            
+            # If no improvement for 'patience' episodes, stop training
+            if no_improvement >= patience:
+                print(f"Early stopping at episode {episode}. No improvement for {patience} episodes.")
+                
+                # Restore best model
+                for agent in env.agents:
+                    ql_agent.q_networks[agent].load_state_dict(best_model_state[agent])
+                    ql_agent.target_networks[agent].load_state_dict(best_model_state[agent])
+                    
+                print(f"Restored best model from episode {best_episode}")
+                break
 
         # Save model periodically
         if episode % save_every == 0:
@@ -544,20 +691,119 @@ def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
     # Return trained agent
     return ql_agent
 
+def train_DQN_curriculum(target_env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, save_every=100, model_path=get_model_path()):
+    """
+    Train Q-learning agent with improved curriculum learning.
+    """
+    # Create models directory if it doesn't exist
+    model_dir = os.path.dirname(model_path)
+    if not os.path.exists(model_dir):
+        os.makedirs(model_dir)
+        print(f"Created models directory: {model_dir}")
+    
+    print(f"Using model path: {model_path}")
+    
+    # STAGE 1: Basic Navigation (5x5, fully observable)
+    stage1_env = env(grid_size=(5, 5), n_agents=1, n_humans=0, num_shelves=0, 
+                    num_pickup_points=1, num_dropoff_points=1, render_mode="human")
+    agent = train_DQN(stage1_env, n_episodes=250, max_steps=100, save_every=50, model_path=model_path)
+    
+    # Explicitly save model after stage 1
+    agent.save_model(model_path)
+    print(f"Stage 1 complete - model saved to {model_path}")
+    
+    # Create copy of Stage 1 network
+    stage1_model_path = model_path.replace('.pth', '_stage1.pth')
+    agent.save_model(stage1_model_path)
+    print(f"Stage 1 model backup saved to {stage1_model_path}")
+    
+    # Benchmark stage 1 with 10 evaluation runs
+    print("\nEvaluating Stage 1 Performance (10 runs)...")
+    stage1_evaluations = []
+    for i in range(10):
+        print(f"\nEvaluation Run {i+1}/10")
+        # Create fresh environment for each evaluation
+        eval_env = env(grid_size=(5, 5), n_agents=1, n_humans=0, num_shelves=0, 
+                      num_pickup_points=1, num_dropoff_points=1, render_mode="human")
+        completed_tasks = run_q_learning(eval_env, model_path=model_path, n_steps=100, debug_level=DEBUG_NONE)
+        stage1_evaluations.append(completed_tasks)
+        
+        # Close environment to free resources
+        eval_env.close()
+        import matplotlib.pyplot as plt
+        plt.close('all')
+    
+    avg_stage1_performance = sum(stage1_evaluations) / len(stage1_evaluations)
+    print(f"\nStage 1 Performance Summary:")
+    print(f"Individual runs: {stage1_evaluations}")
+    print(f"Average completed tasks: {avg_stage1_performance:.2f}")
+    
+    # Full benchmark (just once) to see A* comparison
+    print("\nBenchmarking Stage 1 against A*...")
+    benchmark1 = benchmark_environment(stage1_env, n_steps=100, debug_level=DEBUG_NONE, model_path=model_path)
+    
+    # STAGE 2: Navigation with simple obstacles
+    print("\nStarting Stage 2 Training...")
+    agent.epsilon = 0.6
+    agent.epsilon_decay = 0.992
+    
+    for agent_name in agent.optimizers:
+        for param_group in agent.optimizers[agent_name].param_groups:
+            param_group['lr'] *= 0.5
+    
+    stage2_env = env(grid_size=(10, 8), n_agents=1, n_humans=0, num_shelves=16, 
+                    num_pickup_points=1, num_dropoff_points=1, render_mode="human")
+    agent = train_DQN(stage2_env, agent=agent, n_episodes=200, max_steps=150, 
+                     save_every=25, model_path=model_path)
+    
+    # Explicitly save model after stage 2
+    agent.save_model(model_path)
+    print(f"Stage 2 complete - model saved to {model_path}")
+    
+    # Benchmark stage 2 with 10 evaluation runs
+    print("\nEvaluating Stage 2 Performance (10 runs)...")
+    stage2_evaluations = []
+    for i in range(10):
+        print(f"\nEvaluation Run {i+1}/10")
+        # Create fresh environment for each evaluation
+        eval_env = env(grid_size=(10, 8), n_agents=1, n_humans=0, num_shelves=16, 
+                      num_pickup_points=1, num_dropoff_points=1, render_mode="human")
+        completed_tasks = run_q_learning(eval_env, model_path=model_path, n_steps=150, debug_level=DEBUG_NONE)
+        stage2_evaluations.append(completed_tasks)
+        
+        # Close environment to free resources
+        eval_env.close()
+        import matplotlib.pyplot as plt
+        plt.close('all')
+    
+    avg_stage2_performance = sum(stage2_evaluations) / len(stage2_evaluations)
+    print(f"\nStage 2 Performance Summary:")
+    print(f"Individual runs: {stage2_evaluations}")
+    print(f"Average completed tasks: {avg_stage2_performance:.2f}")
+    
+    # Full benchmark (just once) to see A* comparison
+    print("\nBenchmarking Stage 2 against A*...")
+    benchmark2 = benchmark_environment(stage2_env, n_steps=150, debug_level=DEBUG_NONE, model_path=model_path)
+    
+    # Return performance metrics
+    return {
+        "stage1_evals": stage1_evaluations,
+        "stage1_avg": avg_stage1_performance,
+        "stage2_evals": stage2_evaluations, 
+        "stage2_avg": avg_stage2_performance,
+        "stage1_benchmark": benchmark1,
+        "stage2_benchmark": benchmark2
+    }
+
 def run_q_learning(env, model_path=get_model_path(), n_steps=1000, debug_level=DEBUG_NONE):
     """
     Run trained Q-learning agent in the warehouse environment.
-    
-    Args:
-        env: Warehouse environment.
-        model_path: Path to the trained model.
-        n_steps: Number of steps to run (default: 1000).
-        debug_level: Debug level (default: DEBUG_NONE).
     """
     
-    # Initialize agent
+    # Initialize agent in evaluation mode
     QL_agent = QLAgent(env, debug_level=debug_level)
-
+    QL_agent.epsilon = 0.05  # Small epsilon for minimal exploration during evaluation
+    
     # Load the trained model if it exists
     try:
         QL_agent.load_model(model_path)
@@ -567,37 +813,136 @@ def run_q_learning(env, model_path=get_model_path(), n_steps=1000, debug_level=D
 
     # Reset environment
     observations, _ = env.reset()
+    
+    total_rewards = 0
+    completed_tasks = 0
+    
+    # Track action statistics to detect bias
+    action_counts = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0, 5: 0, 6: 0}
 
     # Run for n_steps
     for step in range(n_steps):
         # Get actions for each agent
         actions = {}
+        
         for agent in env.agents:
             state = observations[agent]
-            actions[agent] = QL_agent.select_action(state, agent, eval_mode=True)
+            # Force evaluation mode
+            action = QL_agent.select_action(state, agent, eval_mode=True)
+            actions[agent] = action
+            action_counts[action] += 1
 
         # Take actions in the environment
         observations, rewards, terminations, truncations, infos = env.step(actions)
 
+        # Track metrics
+        total_rewards += sum(rewards.values())
+        
+        # Update task completion for tracking
+        completed_tasks = sum(env.completed_tasks.values())
+        
         # Render the environment
         env.render()
 
         # Debug info
-        print(f"Step {step}")
+        print(f"Step {step}, Tasks: {completed_tasks}")
         print(f"Actions: {actions}")
         print(f"Rewards: {rewards}")
-        print(f"Completed tasks: {env.completed_tasks}")
+
+        # Print action distribution every 20 steps
+        if step > 0 and step % 20 == 0:
+            print("\nAction distribution so far:")
+            total = sum(action_counts.values())
+            for action, count in action_counts.items():
+                action_name = ["LEFT", "DOWN", "RIGHT", "UP", "PICKUP", "DROPOFF", "WAIT"][action]
+                percentage = (count / total) * 100
+                print(f"  {action_name}: {count} ({percentage:.1f}%)")
 
         # Check if done
         if all(terminations.values()) or all(truncations.values()):
             break
-
-    # Close the environment
+    
+    # Print final results
+    print(f"Final score: {total_rewards}")
+    print(f"Completed tasks: {completed_tasks}")
+    
+    # Print final action distribution
+    print("\nFinal action distribution:")
+    total = sum(action_counts.values())
+    for action, count in action_counts.items():
+        action_name = ["LEFT", "DOWN", "RIGHT", "UP", "PICKUP", "DROPOFF", "WAIT"][action]
+        percentage = (count / total) * 100
+        print(f"  {action_name}: {count} ({percentage:.1f}%)")
+    
+    # Clean up
+    import matplotlib.pyplot as plt
+    plt.close('all')
     env.close()
-    # Print final score
-    final_score = sum(rewards.values())
-    print(f"Final score: {final_score}")
-    return final_score
+    
+    return completed_tasks
+
+def benchmark_environment(env, n_steps=200, debug_level=DEBUG_NONE, model_path=get_model_path()):
+    """
+    Run both A* and RL agents on the same environment to establish performance benchmarks.
+    """
+    import matplotlib.pyplot as plt
+    from copy import deepcopy
+    import time
+    
+    # Create completely separate environment instances
+    env_copy_astar = deepcopy(env)
+    env_copy_rl = deepcopy(env)
+    
+    # Ensure environments are properly configured
+    env_copy_astar.render_mode = "human"
+    env_copy_rl.render_mode = "human"
+    
+    # Check if model exists before running benchmark
+    model_exists = os.path.isfile(model_path)
+    if not model_exists:
+        print(f"WARNING: Model file not found at {model_path}")
+        # Try to find best model
+        best_model_path = model_path.replace('.pth', '_best.pth')
+        if os.path.isfile(best_model_path):
+            print(f"Using best model found at {best_model_path}")
+            model_path = best_model_path
+        else:
+            print("No model found! Benchmark will use untrained agent.")
+    else:
+        print(f"Using model from {model_path}")
+    
+    # Run A* agent
+    print("Running A* benchmark...")
+    astar_tasks = run_a_star(env_copy_astar, n_steps=n_steps, debug_level=debug_level)
+    
+    # Close any open plots and delay to ensure resources are released
+    plt.close('all')
+    time.sleep(1)
+    
+    # Run RL agent with explicit model loading
+    print("Running RL benchmark...")
+    rl_tasks = run_q_learning(env_copy_rl, model_path=model_path, n_steps=n_steps, debug_level=debug_level)
+    
+    # Close any open plots
+    plt.close('all')
+    
+    # Calculate performance ratio (RL / A*)
+    if astar_tasks and astar_tasks > 0:  # Ensure it's not None and positive
+        performance_ratio = rl_tasks / astar_tasks
+    else:
+        performance_ratio = 0
+        
+    # Print benchmark results
+    print("\n=== BENCHMARK RESULTS ===")
+    print(f"A* completed tasks: {astar_tasks}")
+    print(f"RL completed tasks: {rl_tasks}")
+    print(f"Performance ratio (RL/A*): {performance_ratio:.2f}")
+    
+    return {
+        "astar_tasks": astar_tasks,
+        "rl_tasks": rl_tasks,
+        "performance_ratio": performance_ratio
+    }
 
 
 

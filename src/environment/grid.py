@@ -68,7 +68,7 @@ class WarehouseEnv(ParallelEnv):
     def observation_space(self, agent):
         """
         Return the observation space for a specific agent
-        The observation is a 9-channel grid of size (5, 5) around the agent
+        The observation is a 10-channel grid of size (5, 5) around the agent
         with the following channels:
         1. Agent's position (1 at agent's position, 0 elsewhere)
         2. Other agents' positions (1 at other agents' positions, 0 elsewhere)
@@ -79,9 +79,10 @@ class WarehouseEnv(ParallelEnv):
         7. Dropoff points' positions (1 at dropoff points' positions, 0 elsewhere)
         8. Agent's carrying status (1 if agent is carrying, 0 otherwise)
         9. Valid pickup/drop indicator (1 if agent is at a valid pickup/drop point, 0 otherwise)
+        10. Goal direction indicator (direction to goal when outside view)
         """
 
-        obs_shape = (9,) + self.local_observation_size
+        obs_shape = (10,) + self.local_observation_size
         return spaces.Box(low=0, high=1, shape=obs_shape, dtype=np.float32)
 
     def reset(self, seed=None, options=None):
@@ -272,6 +273,21 @@ class WarehouseEnv(ParallelEnv):
                     self.grid[new_row, new_col] not in [2, 3]): # Not a shelf or human
                         new_pos = (new_row, new_col)
                         self.total_distance[agent] += 1
+                else:
+                    # NEW: Add penalty for attempting to move into a wall or obstacle
+                    if (new_row < 0 or new_row >= self.grid_size[0] or 
+                        new_col < 0 or new_col >= self.grid_size[1]):
+                        # Boundary collision
+                        rewards[agent] -= 3.0
+                        self.collisions[agent] += 1
+                    elif self.grid[new_row, new_col] == 2:
+                        # Shelf collision
+                        rewards[agent] -= 2.0
+                        self.collisions[agent] += 1
+                    elif self.grid[new_row, new_col] == 3:
+                        # Human collision
+                        rewards[agent] -= 2.5
+                        self.collisions[agent] += 1
             
             # Store intended position
             new_positions[agent] = new_pos
@@ -637,9 +653,10 @@ class WarehouseEnv(ParallelEnv):
 
         # Get agent's position
         agent_pos = self.agent_positions[agent]
+        goal_pos = self.agent_goals[agent]
 
         # Initialize observation channels
-        obs = np.zeros((9,) + self.local_observation_size, dtype=np.float32)
+        obs = np.zeros((10,) + self.local_observation_size, dtype=np.float32)
 
         # Extract the local observation window (5x5 grid around the agent)
         r, c = agent_pos
@@ -706,6 +723,64 @@ class WarehouseEnv(ParallelEnv):
                     if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
                         if (gr, gc) in self.pickup_points:
                             obs[8, lr, lc] = 1
+
+        # Channel 10: Goal direction indicator
+
+        # Calculate direction vector from agent to goal
+        dr = goal_pos[0] - agent_pos[0]  # row difference (y)
+        dc = goal_pos[1] - agent_pos[1]  # column difference (x)
+
+        # Create a compass-like direction indicator around the agent
+        center_r = window_size
+        center_c = window_size
+
+        # Determine the strongest direction component
+        if abs(dr) > abs(dc):
+            # Vertical direction is stronger
+            if dr > 0:  # Goal is below
+                obs[9, min(center_r + 1, 2*window_size), center_c] = 1
+            else:       # Goal is above
+                obs[9, max(center_r - 1, 0), center_c] = 1
+        else:
+            # Horizontal direction is stronger
+            if dc > 0:  # Goal is to the right
+                obs[9, center_r, min(center_c + 1, 2*window_size)] = 1
+            else:       # Goal is to the left
+                obs[9, center_r, max(center_c - 1, 0)] = 1
+                
+        # Add diagonal directions when both components are significant
+        if abs(dr) > 0 and abs(dc) > 0:
+            if dr > 0 and dc > 0:  # Goal is bottom-right
+                obs[9, min(center_r + 1, 2*window_size), min(center_c + 1, 2*window_size)] = 0.7
+            elif dr > 0 and dc < 0:  # Goal is bottom-left
+                obs[9, min(center_r + 1, 2*window_size), max(center_c - 1, 0)] = 0.7
+            elif dr < 0 and dc > 0:  # Goal is top-right
+                obs[9, max(center_r - 1, 0), min(center_c + 1, 2*window_size)] = 0.7
+            elif dr < 0 and dc < 0:  # Goal is top-left
+                obs[9, max(center_r - 1, 0), max(center_c - 1, 0)] = 0.7
+
+        # Handle equal distances more fairly
+        if abs(dr) == abs(dc):
+            # Equal absolute distances - signal both directions
+            if dr > 0:  # Goal is below
+                obs[9, min(center_r + 1, 2*window_size), center_c] = 0.9
+            else:       # Goal is above
+                obs[9, max(center_r - 1, 0), center_c] = 0.9
+
+            if dc > 0:  # Goal is to the right
+                obs[9, center_r, min(center_c + 1, 2*window_size)] = 0.9
+            else:       # Goal is to the left
+                obs[9, center_r, max(center_c - 1, 0)] = 0.9
+
+            # Also enhance the appropriate diagonal
+            if dr > 0 and dc > 0:  # Goal is bottom-right
+                obs[9, min(center_r + 1, 2*window_size), min(center_c + 1, 2*window_size)] = 1.0
+            elif dr > 0 and dc < 0:  # Goal is bottom-left
+                obs[9, min(center_r + 1, 2*window_size), max(center_c - 1, 0)] = 1.0
+            elif dr < 0 and dc > 0:  # Goal is top-right
+                obs[9, max(center_r - 1, 0), min(center_c + 1, 2*window_size)] = 1.0
+            elif dr < 0 and dc < 0:  # Goal is top-left
+                obs[9, max(center_r - 1, 0), max(center_c - 1, 0)] = 1.0
 
         return obs
     
@@ -918,17 +993,152 @@ class WarehouseEnv(ParallelEnv):
             self.agent_goals[agent] = self.pickup_points[pickup_idx]
             
     def _fourth_pass(self, agent, action, current_pos, rewards):
-
         # Distance to goal
         goal = self.agent_goals[agent]
         prev_pos = self.previous_positions[agent]
 
-        # Reward for moving closer to goal
-        if prev_pos != None:
-            prev_dist = abs(prev_pos[0] - goal[0]) + abs(prev_pos[1] - goal[1])
-            curr_dist = abs(current_pos[0] - goal[0]) + abs(current_pos[1] - goal[1])
-            if curr_dist < prev_dist:
-                rewards[agent] += 1
+        # Initialize action and position history if they don't exist
+        if not hasattr(self, 'action_history'):
+            self.action_history = {agent: [] for agent in self.agents}
+        if not hasattr(self, 'position_history'):
+            self.position_history = {agent: [] for agent in self.agents}
+        if not hasattr(self, 'oscillation_count'):
+            self.oscillation_count = {agent: 0 for agent in self.agents}
+                
+        # Track last few actions and positions
+        self.action_history[agent] = self.action_history[agent][-10:] + [action]
+        self.position_history[agent] = self.position_history[agent][-10:] + [current_pos]
+        
+        # ANTI-OSCILLATION STRATEGY (ENHANCED):
+        
+        # 1. Detect repetitive action patterns of increasing length with stronger penalties
+        oscillation_detected = False
+        if len(self.action_history[agent]) >= 8:
+            actions = self.action_history[agent]
+            positions = self.position_history[agent]
+            
+            # Check for 4-pattern (e.g., 1,3,1,3 repeated twice)
+            if actions[-8:-4] == actions[-4:]:
+                penalty = -10.0  # Increased from -8.0
+                rewards[agent] += penalty
+                oscillation_detected = True
+                
+            # Check for 3-pattern (e.g., 2,0,1 repeated twice)  
+            elif len(actions) >= 6 and actions[-6:-3] == actions[-3:]:
+                penalty = -6.0  # Increased from -5.0
+                rewards[agent] += penalty
+                oscillation_detected = True
+                
+            # Check for 2-pattern (e.g., 0,2 repeated twice)
+            elif len(actions) >= 4 and actions[-4:-2] == actions[-2:]:
+                penalty = -3.0  # Same as before
+                rewards[agent] += penalty
+                oscillation_detected = True
+        
+        # 2. Position oscillation detection (returning to same position)
+        if len(self.position_history[agent]) >= 6:
+            positions = self.position_history[agent]
+            # If agent returned to a position it was at 2-4 steps ago
+            if current_pos in positions[:-1][-4:]:
+                idx = len(positions) - 1 - positions[:-1][::-1].index(current_pos)
+                steps_between = len(positions) - 1 - idx
+                if steps_between <= 4:  # Only penalize if it was a short cycle
+                    penalty = -3.0 * (4 - steps_between + 1)  # Increased from -2.0
+                    rewards[agent] += penalty
+                    oscillation_detected = True
+        
+        # 3. Track persistent oscillation and apply escalating penalties
+        if oscillation_detected:
+            self.oscillation_count[agent] += 1
+            # Apply an additional penalty that increases with consecutive oscillations
+            escalation_penalty = -0.5 * min(self.oscillation_count[agent], 10)
+            rewards[agent] += escalation_penalty
+        else:
+            # Reset or decay the oscillation count when no oscillation is detected
+            self.oscillation_count[agent] = max(0, self.oscillation_count[agent] - 1)
+        
+        # 4. Progressive path-based rewards for goal progress
+        if prev_pos is not None and prev_pos != current_pos:  # Only when position changes
+            if self.num_shelves > 0:
+                try:
+                    prev_path_dist = self._calculate_path_distance(prev_pos, goal)
+                    curr_path_dist = self._calculate_path_distance(current_pos, goal)
+                    path_delta = prev_path_dist - curr_path_dist
+                    
+                    if path_delta > 0:
+                        # We're getting closer - use STEEPER exponential reward to incentivize direct paths
+                        reward = 1.5 * (path_delta ** 1.5)  # Increased exponent from 1.2 to 1.5
+                        rewards[agent] += reward
+                        
+                        # Add DIRECTION CONSISTENCY BONUS
+                        # Check if we're moving in the same general direction as the goal
+                        dr = goal[0] - current_pos[0]  # row difference (goal direction)
+                        dc = goal[1] - current_pos[1]  # col difference
+                        
+                        # Determine primary direction to goal
+                        if abs(dr) > abs(dc):
+                            # Vertical movement is better
+                            if dr > 0 and action == 1:  # DOWN toward goal
+                                rewards[agent] += 0.8
+                            elif dr < 0 and action == 3:  # UP toward goal
+                                rewards[agent] += 0.8
+                        else:
+                            # Horizontal movement is better
+                            if dc > 0 and action == 2:  # RIGHT toward goal
+                                rewards[agent] += 0.8
+                            elif dc < 0 and action == 0:  # LEFT toward goal
+                                rewards[agent] += 0.8
+                    else:
+                        # We're moving away - calculate if this might be a necessary detour
+                        # Check if current pos is in a corridor or at a junction
+                        open_directions = 0
+                        for dr, dc in [(0, 1), (1, 0), (0, -1), (-1, 0)]:
+                            nr, nc = current_pos[0] + dr, current_pos[1] + dc
+                            if (0 <= nr < self.grid_size[0] and 
+                                0 <= nc < self.grid_size[1] and
+                                self.grid[nr, nc] != 2):
+                                open_directions += 1
+                        
+                        # If at a junction or corridor (more than 2 open directions), be more lenient
+                        if open_directions > 2:
+                            rewards[agent] += path_delta * 0.25  # Reduced from 0.3
+                        else:
+                            rewards[agent] += path_delta * 0.4  # Reduced from 0.5
+                    
+                    # Small bonus for movement to prevent getting stuck
+                    if action < 4:  # Movement action
+                        rewards[agent] += 0.2  # Increased from 0.1
+                        
+                except Exception as e:
+                    # Fallback to Manhattan distance if path calculation fails
+                    prev_dist = abs(prev_pos[0] - goal[0]) + abs(prev_pos[1] - goal[1])
+                    curr_dist = abs(current_pos[0] - goal[0]) + abs(current_pos[1] - goal[1])
+                    dist_delta = prev_dist - curr_dist
+                    rewards[agent] += dist_delta * 1.2  # Increased from 1.0
+            else:
+                # Simple environment without shelves - use Manhattan distance
+                prev_dist = abs(prev_pos[0] - goal[0]) + abs(prev_pos[1] - goal[1])
+                curr_dist = abs(current_pos[0] - goal[0]) + abs(current_pos[1] - goal[1])
+                dist_delta = prev_dist - curr_dist
+                rewards[agent] += dist_delta * 1.2  # Increased from 1.0
+
+        # 4. Enhanced wait action handling
+        if action == 6:
+            # Count consecutive waits
+            wait_count = 1
+            for prev_action in reversed(self.action_history[agent][:-1]):  # Skip current action
+                if prev_action == 6:
+                    wait_count += 1
+                else:
+                    break
+            
+            # Progressive penalty based on count
+            wait_penalty = -1.0 * min(10, wait_count)  # Caps at -10
+            rewards[agent] += wait_penalty
+            pass
+
+        # Rest of the code (pickup/dropoff handling) remains unchanged
+        # ... (existing pickup/dropoff logic)
 
         # Handle pickup action (4)
         if action == 4:
@@ -949,8 +1159,12 @@ class WarehouseEnv(ParallelEnv):
                     self.agent_goals[agent] = self.dropoff_points[dropoff_idx]
 
                 else:
-                    # Wrong pickup point, small penalty
-                    rewards[agent] += -0.1
+                    # Wrong pickup point, penalty
+                    rewards[agent] += -5
+
+            # For invalid pickup:
+            if not (current_pos in self.pickup_points and not self.agent_carrying[agent]):
+                rewards[agent] += -10  # Stronger penalty
 
         # Handle dropoff action (5)
         elif action == 5:
@@ -968,15 +1182,60 @@ class WarehouseEnv(ParallelEnv):
                     # Assign new goal (pickup point)
                     self._assign_new_goal(agent)
                 else:
-                    # Wrong dropoff point, small penalty
-                    rewards[agent] += -0.1
+                    # Wrong dropoff point, penalty
+                    rewards[agent] += -5
+
+            # For invalid dropoff:
+            if not (current_pos in self.dropoff_points and self.agent_carrying[agent]):
+                rewards[agent] += -10  # Stronger penalty
 
         # Handle wait action (6)
         elif action == 6:
-            # No action taken, just wait
-            # Add a small penalty for waiting
-            rewards[agent] += 2 * self.step_cost
+            # Count consecutive waits
+            wait_count = 1
+            for prev_action in reversed(self.action_history[agent][:-1]):  # Skip current action
+                if prev_action == 6:
+                    wait_count += 1
+                else:
+                    break
+            
+            # Progressive penalty based on count
+            wait_penalty = -1.0 * min(10, wait_count)  # Caps at -10
+            rewards[agent] += wait_penalty
             pass
+
+    def _calculate_path_distance(self, current_pos, goal_pos):
+        """Calculate a more meaningful distance considering obstacles"""
+        
+        # Simple BFS to find shortest path length
+        from collections import deque
+        
+        visited = set()
+        queue = deque([(current_pos, 0)])  # (position, distance)
+        visited.add(current_pos)
+        
+        while queue:
+            pos, dist = queue.popleft()
+            
+            if pos == goal_pos:
+                return dist
+            
+            # Check all four directions
+            for dr, dc in [(0, -1), (1, 0), (0, 1), (-1, 0)]:
+                new_r, new_c = pos[0] + dr, pos[1] + dc
+                new_pos = (new_r, new_c)
+                
+                # Check if position is valid and not a shelf
+                if (0 <= new_r < self.grid_size[0] and 
+                    0 <= new_c < self.grid_size[1] and
+                    self.grid[new_r, new_c] != 2 and  # Not a shelf
+                    new_pos not in visited):
+                    
+                    visited.add(new_pos)
+                    queue.append((new_pos, dist + 1))
+        
+        # If no path found, use Manhattan distance as fallback
+        return abs(current_pos[0] - goal_pos[0]) + abs(current_pos[1] - goal_pos[1])
 
 def second_pass(entities_order, current_positions, new_positions, actions, all_entities, reserved_positions, allow_overlap=False):
     final_positions = {}
