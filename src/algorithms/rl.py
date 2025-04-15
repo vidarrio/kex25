@@ -8,6 +8,7 @@ from collections import namedtuple, deque
 from subprocess import call
 import time
 from torch.cuda.amp import autocast
+import matplotlib.pyplot as plt  # add import for plotting near the other imports
 
 # Debug levels
 DEBUG_NONE = 0
@@ -108,7 +109,7 @@ class ReplayBuffer:
         # Prioritize successful experiences
         if reward > 10.0: # task completion
             # Add experience multiple times
-            for _ in range(10):
+            for _ in range(3):
                 self.memory.append(e)
         else:
             # Add experience once
@@ -153,8 +154,8 @@ class QLAgent:
 
     def __init__(self, env, debug_level=DEBUG_NONE,
                  alpha=0.001, gamma=0.99, epsilon_start=1.0, epsilon_end=0.1,
-                 epsilon_decay=0.98, hidden_size=64, buffer_size=50000, batch_size=256,
-                 update_freq=8, tau=0.001):
+                 epsilon_decay=0.98, hidden_size=64, buffer_size=50000, batch_size=128,
+                 update_freq=4, tau=0.005):
         """
         Initialize the Q-learning agent.
 
@@ -178,7 +179,7 @@ class QLAgent:
 
         # Get observation shape from environment
         observation_shape = env.observation_size
-        observation_channels = 9
+        observation_channels = 10
 
         # State and action dimentions
         self.state_size = (observation_channels, *observation_shape)
@@ -215,6 +216,9 @@ class QLAgent:
         # Tracking training progress
         self.completed_tasks = []
         self.episode_rewards = []
+
+        # Add attribute to store loss values for the current episode
+        self.episode_losses = []
 
     def debug(self, level, message):
         """
@@ -400,6 +404,8 @@ class QLAgent:
 
         # Compute loss and update weights
         loss = F.mse_loss(q_values, targets)
+        # Append current loss to the episode_losses for plotting later
+        self.episode_losses.append(loss.item())
 
         # Zero gradients (reset gradients)
         self.optimizers[agent].zero_grad(set_to_none=True)
@@ -443,7 +449,6 @@ def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
     Returns:
         agent: Trained Q-learning agent.
     """
-
     # Verify GPU usage
     if torch.cuda.is_available():
         print(f"CUDA available: {torch.cuda.is_available()}")
@@ -461,6 +466,7 @@ def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
 
     # Track scores
     scores = []
+    avg_losses = []  # list to store average loss per episode
 
     # Add timing variables
     total_env_time = 0
@@ -476,6 +482,7 @@ def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
         env_reset_start = time.time()
         observations, _ = env.reset()
         total_env_time += time.time() - env_reset_start
+        ql_agent.episode_losses = []  # reset loss list for new episode
         score = 0
 
         # Run episode
@@ -500,7 +507,8 @@ def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
             observations = next_observations
             
             # Render environment
-            # env.render()
+            # if episode > 200:
+            #     env.render()
 
             # Debug info
             ql_agent.debug(DEBUG_INFO, f"Episode {episode}, Step {step}")
@@ -508,7 +516,7 @@ def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
             ql_agent.debug(DEBUG_INFO, f"Rewards: {rewards}")
             ql_agent.debug(DEBUG_INFO, f"Completed tasks: {env.completed_tasks}")
             ql_agent.debug(DEBUG_INFO, f"Score: {score}")
-
+            
             # Check if episode is done
             if all(terminations.values() or all(truncations.values())):
                 break
@@ -523,6 +531,15 @@ def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
         ql_agent.episode_rewards.append(score)
         ql_agent.completed_tasks.append(env.completed_tasks)
 
+        # Compute average loss for the episode (if any loss was recorded)
+        if ql_agent.episode_losses:
+            episode_avg_loss = np.mean(ql_agent.episode_losses)
+            avg_losses.append(episode_avg_loss)
+            print(f"Episode {episode} average loss: {episode_avg_loss:.4f}")
+        else:
+            avg_losses.append(0)
+            print(f"Episode {episode} average loss: 0.0000")
+            
         # Log episode results
         ql_agent.debug(DEBUG_CRITICAL, f"Episode {episode}/{n_episodes}, Score: {score}, Completed tasks: {env.completed_tasks}, Epsilon: {ql_agent.epsilon:.4f}")
 
@@ -540,6 +557,16 @@ def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
             
     # Save final model
     ql_agent.save_model(model_path)
+
+    # Plot the average loss per episode
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(1, n_episodes + 1), avg_losses, marker='o', color='r', label="Avg Loss per Episode")
+    plt.xlabel("Episode")
+    plt.ylabel("Average Loss")
+    plt.title("Training Loss Progression")
+    plt.grid(True)
+    plt.legend()
+    plt.show()
 
     # Return trained agent
     return ql_agent

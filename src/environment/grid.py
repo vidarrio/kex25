@@ -16,7 +16,7 @@ class WarehouseEnv(ParallelEnv):
     metadata = {'render_modes': ['human', 'rgb_array'], 'name': 'warehouse_v0'}
 
     def __init__(self, grid_size=(20, 20), human_grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, 
-                 num_pickup_points=3, num_dropoff_points=2, collision_penalty=-2, task_reward=50, step_cost=-0.1,
+                 num_pickup_points=3, num_dropoff_points=2, collision_penalty=-2, task_reward=100, step_cost=-2,
                  observation_size=(5, 5), render_mode=None):
         super().__init__()
 
@@ -81,7 +81,7 @@ class WarehouseEnv(ParallelEnv):
         9. Valid pickup/drop indicator (1 if agent is at a valid pickup/drop point, 0 otherwise)
         """
 
-        obs_shape = (9,) + self.local_observation_size
+        obs_shape = (10,) + self.local_observation_size
         return spaces.Box(low=0, high=1, shape=obs_shape, dtype=np.float32)
 
     def reset(self, seed=None, options=None):
@@ -108,17 +108,20 @@ class WarehouseEnv(ParallelEnv):
         self.pickup_points = self._place_random_points(self.num_pickup_points, [1, 2])
         for pos in self.pickup_points:
             self.grid[pos] = 4
-
+            
+            
         # Place dropoff points (e.g. shipping area)
-        self.dropoff_points = self._place_random_points(self.num_dropoff_points, [1, 2, 4])
-        for pos in self.dropoff_points:
-            self.grid[pos] = 5
+        # self.dropoff_points = self._place_random_points(self.num_dropoff_points, [1, 2, 4])
+        # for pos in self.dropoff_points:
+        #     self.grid[pos] = 5
+        # Place dropoff points (e.g. shipping area)
+        self._place_dropoff_points()
 
         # Initialize agents at random positions
         self.agent_positions = {}
         self.agent_carrying = {agent: False for agent in self.agents}
         self.agent_goals = {}
-        self.agent_item_types = {} # What type of item the agent is carrying (possible extension)
+        self.agent_item_types = {agent: None for agent in self.agents}
 
         for agent in self.agents:
             # Find empty position
@@ -271,7 +274,7 @@ class WarehouseEnv(ParallelEnv):
                     0 <= new_col < self.grid_size[1] and
                     self.grid[new_row, new_col] not in [2, 3]): # Not a shelf or human
                         new_pos = (new_row, new_col)
-                        self.total_distance[agent] += 1
+                        self.total_distance[agent] += 0.3
             
             # Store intended position
             new_positions[agent] = new_pos
@@ -639,7 +642,7 @@ class WarehouseEnv(ParallelEnv):
         agent_pos = self.agent_positions[agent]
 
         # Initialize observation channels
-        obs = np.zeros((9,) + self.local_observation_size, dtype=np.float32)
+        obs = np.zeros((10,) + self.local_observation_size, dtype=np.float32)
 
         # Extract the local observation window (5x5 grid around the agent)
         r, c = agent_pos
@@ -706,7 +709,43 @@ class WarehouseEnv(ParallelEnv):
                     if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
                         if (gr, gc) in self.pickup_points:
                             obs[8, lr, lc] = 1
+                            
+        # Channel 10: Compass-like direction to the agent's goal
+        goal_pos = self.agent_goals[agent]
+        goal_r, goal_c = goal_pos
+        delta_r, delta_c = goal_r - r, goal_c - c
 
+        if abs(delta_r) > window_size or abs(delta_c) > window_size:
+            # Goal is outside the observation window
+            if delta_r < 0 and delta_c == 0:
+                # North
+                obs[9, 0, window_size] = 1
+            elif delta_r < 0 and delta_c > 0:
+                # Northeast
+                obs[9, 0, -1] = 1
+            elif delta_r == 0 and delta_c > 0:
+                # East
+                obs[9, window_size, -1] = 1
+            elif delta_r > 0 and delta_c > 0:
+                # Southeast
+                obs[9, -1, -1] = 1
+            elif delta_r > 0 and delta_c == 0:
+                # South
+                obs[9, -1, window_size] = 1
+            elif delta_r > 0 and delta_c < 0:
+                # Southwest
+                obs[9, -1, 0] = 1
+            elif delta_r == 0 and delta_c < 0:
+                # West
+                obs[9, window_size, 0] = 1
+            elif delta_r < 0 and delta_c < 0:
+                # Northwest
+                obs[9, 0, 0] = 1
+        else:
+            # Goal is within the observation window
+            direction_r = delta_r + window_size
+            direction_c = delta_c + window_size
+            obs[9, direction_r, direction_c] = 1
         return obs
     
     def _get_human_observation(self, human):
@@ -902,6 +941,32 @@ class WarehouseEnv(ParallelEnv):
             pos = get_random_empty_position(grid=self.grid, grid_size=self.grid_size, avoid_values=avoid_values)
             points.append(pos)
         return points
+
+
+    def _place_dropoff_points(self):
+        """
+        Hardcode dropoff points in the corners of the grid.
+        """
+        # Corners of the grid
+        corners = [
+            (0, 0),  # Top-left corner
+            (0, self.grid_size[1] - 1),  # Top-right corner
+            (self.grid_size[0] - 1, 0),  # Bottom-left corner
+            (self.grid_size[0] - 1, self.grid_size[1] - 1)  # Bottom-right corner
+        ]
+        # Middle point of the grid
+        # Middle points of the edges
+        middle_edges = [
+            (0, self.grid_size[1] // 2),  # Middle of the bottom edge
+            (self.grid_size[0] - 1, self.grid_size[1] // 2),  # Middle of the top edge
+            (self.grid_size[0] // 2, 0),  # Middle of the left edge
+            (self.grid_size[0] // 2, self.grid_size[1] - 1)  # Middle of the right edge
+        ]
+        all_dropoff_points = corners + middle_edges
+        
+        self.dropoff_points = all_dropoff_points[:self.num_dropoff_points]
+        for pos in self.dropoff_points:
+            self.grid[pos] = 5
             
     def _assign_new_goal(self, agent):
         """
@@ -910,7 +975,10 @@ class WarehouseEnv(ParallelEnv):
         
         if self.agent_carrying[agent]:
             # If agent is carrying an item, deliver it to appropriate dropoff point
-            dropoff_idx = self.agent_item_types[agent]
+            # dropoff_idx = self.agent_item_types[agent] ------Not sure about why there is item_typs here-------
+            # dropoff_idx should be based on the dropoff points
+            dropoff_idx = random.randint(0, len(self.dropoff_points) - 1)
+            
             self.agent_goals[agent] = self.dropoff_points[dropoff_idx]
         else:
             # If agent is not carrying an item, go to a random pickup point
@@ -945,12 +1013,11 @@ class WarehouseEnv(ParallelEnv):
                     self.agent_item_types[agent] = pickup_idx % len(self.dropoff_points)
 
                     # Assign new goal (dropoff point)
-                    dropoff_idx = self.agent_item_types[agent]
-                    self.agent_goals[agent] = self.dropoff_points[dropoff_idx]
+                    self._assign_new_goal(agent)
 
                 else:
                     # Wrong pickup point, small penalty
-                    rewards[agent] += -0.1
+                    rewards[agent] += -1
 
         # Handle dropoff action (5)
         elif action == 5:
@@ -969,13 +1036,16 @@ class WarehouseEnv(ParallelEnv):
                     self._assign_new_goal(agent)
                 else:
                     # Wrong dropoff point, small penalty
-                    rewards[agent] += -0.1
+                    rewards[agent] += -1
 
         # Handle wait action (6)
         elif action == 6:
             # No action taken, just wait
             # Add a small penalty for waiting
-            rewards[agent] += 2 * self.step_cost
+            factor = 1
+            if prev_pos == current_pos:
+                factor = 4
+            rewards[agent] += 2 * self.step_cost * factor
             pass
 
 def second_pass(entities_order, current_positions, new_positions, actions, all_entities, reserved_positions, allow_overlap=False):
