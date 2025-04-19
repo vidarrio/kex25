@@ -16,7 +16,7 @@ class WarehouseEnv(ParallelEnv):
     metadata = {'render_modes': ['human', 'rgb_array'], 'name': 'warehouse_v0'}
 
     def __init__(self, grid_size=(20, 20), human_grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, 
-                 num_pickup_points=3, num_dropoff_points=2, collision_penalty=-2, task_reward=100, step_cost=-2,
+                 num_pickup_points=3, num_dropoff_points=2, collision_penalty=-100, task_reward=10, step_cost=-100,
                  observation_size=(5, 5), render_mode=None):
         super().__init__()
 
@@ -996,7 +996,8 @@ class WarehouseEnv(ParallelEnv):
             prev_dist = abs(prev_pos[0] - goal[0]) + abs(prev_pos[1] - goal[1])
             curr_dist = abs(current_pos[0] - goal[0]) + abs(current_pos[1] - goal[1])
             if curr_dist < prev_dist:
-                rewards[agent] += 1
+                rewards[agent] += 5
+            
 
         # Handle pickup action (4)
         if action == 4:
@@ -1017,7 +1018,7 @@ class WarehouseEnv(ParallelEnv):
 
                 else:
                     # Wrong pickup point, small penalty
-                    rewards[agent] += -1
+                    rewards[agent] += -100
 
         # Handle dropoff action (5)
         elif action == 5:
@@ -1036,7 +1037,7 @@ class WarehouseEnv(ParallelEnv):
                     self._assign_new_goal(agent)
                 else:
                     # Wrong dropoff point, small penalty
-                    rewards[agent] += -1
+                    rewards[agent] += -100
 
         # Handle wait action (6)
         elif action == 6:

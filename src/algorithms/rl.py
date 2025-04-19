@@ -9,6 +9,7 @@ from subprocess import call
 import time
 from torch.cuda.amp import autocast
 import matplotlib.pyplot as plt  # add import for plotting near the other imports
+import json  # add this import near the other imports
 
 # Debug levels
 DEBUG_NONE = 0
@@ -154,7 +155,7 @@ class QLAgent:
 
     def __init__(self, env, debug_level=DEBUG_NONE,
                  alpha=0.001, gamma=0.99, epsilon_start=1.0, epsilon_end=0.1,
-                 epsilon_decay=0.98, hidden_size=64, buffer_size=50000, batch_size=128,
+                 epsilon_decay=0.995, hidden_size=64, buffer_size=50000, batch_size=128,
                  update_freq=4, tau=0.005):
         """
         Initialize the Q-learning agent.
@@ -467,6 +468,7 @@ def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
     # Track scores
     scores = []
     avg_losses = []  # list to store average loss per episode
+    avg_score = []
 
     # Add timing variables
     total_env_time = 0
@@ -475,101 +477,121 @@ def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
     total_step_time = 0
     
     # Training loop
-    for episode in range(1, n_episodes + 1):
-        episode_start = time.time()
+    try:
+        for episode in range(1, n_episodes + 1):
+            episode_start = time.time()
+            
+            # Reset environment
+            env_reset_start = time.time()
+            observations, _ = env.reset()
+            total_env_time += time.time() - env_reset_start
+            ql_agent.episode_losses = []  # reset loss list for new episode
+            score = 0
+
+            # Run episode
+            for step in range(max_steps):
+                # Time action selection
+                select_action_start = time.time()
+                actions = ql_agent.select_action_batch(observations)
+                total_select_action_time += time.time() - select_action_start
+
+                # Time environment step
+                env_step_start = time.time()
+                next_observations, rewards, terminations, truncations, infos = env.step(actions)
+                total_env_time += time.time() - env_step_start
+                
+                # Time agent learning step
+                agent_step_start = time.time()
+                ql_agent.step(observations, actions, rewards, next_observations, terminations)
+                total_step_time += time.time() - agent_step_start
+                
+                # Update score and observations
+                score += sum(rewards.values())
+                observations = next_observations
+                
+                # Render environment
+                # if episode > 200:
+                #     env.render()
+
+                # Debug info
+                ql_agent.debug(DEBUG_INFO, f"Episode {episode}, Step {step}")
+                ql_agent.debug(DEBUG_INFO, f"Actions: {actions}")
+                ql_agent.debug(DEBUG_INFO, f"Rewards: {rewards}")
+                ql_agent.debug(DEBUG_INFO, f"Completed tasks: {env.completed_tasks}")
+                ql_agent.debug(DEBUG_INFO, f"Score: {score}")
+                
+                # Check if episode is done
+                if all(terminations.values() or all(truncations.values())):
+                    break
+
+            # Update epsilon for exploration
+            ql_agent.update_epsilon()
+
+            # Save score
+            scores.append(score)
+            
+            avg_score.append(score)
+
+            # Track performance metrics
+            ql_agent.episode_rewards.append(score)
+            ql_agent.completed_tasks.append(env.completed_tasks)
+
+            # Compute average loss for the episode (if any loss was recorded)
+            if ql_agent.episode_losses:
+                episode_avg_loss = np.mean(ql_agent.episode_losses)
+                avg_losses.append(episode_avg_loss)
+                print(f"Episode {episode} average loss: {episode_avg_loss:.4f}")
+            else:
+                avg_losses.append(0)
+                print(f"Episode {episode} average loss: 0.0000")
+                
+            # Log episode results
+            ql_agent.debug(DEBUG_CRITICAL, f"Episode {episode}/{n_episodes}, Score: {score}, Completed tasks: {env.completed_tasks}, Epsilon: {ql_agent.epsilon:.4f}")
+
+            # Save model periodically
+            if episode % save_every == 0:
+                ql_agent.save_model(model_path)
+                
+            # Print timing info every 10 episodes
+            if episode % 10 == 0:
+                print(f"\nTiming breakdown (avg per episode):")
+                print(f"  Environment time: {total_env_time/episode:.4f}s")
+                print(f"  Action selection time: {total_select_action_time/episode:.4f}s")
+                print(f"  Agent learning time: {total_step_time/episode:.4f}s")
+                print(f"  Episode duration: {(time.time() - episode_start):.4f}s\n")
+    except Exception as e:
+        pass
+    finally:
+        # Save final model
+        ql_agent.save_model(model_path)
         
-        # Reset environment
-        env_reset_start = time.time()
-        observations, _ = env.reset()
-        total_env_time += time.time() - env_reset_start
-        ql_agent.episode_losses = []  # reset loss list for new episode
-        score = 0
+        # Save training metrics (average losses and scores) to a JSON file
+        metrics = {
+            "avg_losses": avg_losses,
+            "avg_score": avg_score
+        }
+        current_time = time.strftime("%Y%m%d-%H%M%S")
+        metrics_file = f'{model_path}_training_metrics__{current_time}.json'
+        with open(metrics_file, "w") as f:
+            json.dump(metrics, f)
+        print(f"Training metrics saved to {metrics_file}")
+        
+        # Uncomment the code below to generate and save plots when needed:
+        plt.figure()
+        plt.subplot(2, 1, 1)
+        plt.plot(avg_losses)
+        plt.title("Average Q Loss per Episode")
+        plt.subplot(2, 1, 2)
+        plt.plot(avg_score)
+        plt.title("Average Score per Episode")
+        plt.tight_layout()
+        plot_file = f'{model_path}_training_metrics__{current_time}.png'
+        plt.savefig(plot_file)
+        plt.close()
+        print(f"Training plots saved to {plot_file}")
 
-        # Run episode
-        for step in range(max_steps):
-            # Time action selection
-            select_action_start = time.time()
-            actions = ql_agent.select_action_batch(observations)
-            total_select_action_time += time.time() - select_action_start
-
-            # Time environment step
-            env_step_start = time.time()
-            next_observations, rewards, terminations, truncations, infos = env.step(actions)
-            total_env_time += time.time() - env_step_start
-            
-            # Time agent learning step
-            agent_step_start = time.time()
-            ql_agent.step(observations, actions, rewards, next_observations, terminations)
-            total_step_time += time.time() - agent_step_start
-            
-            # Update score and observations
-            score += sum(rewards.values())
-            observations = next_observations
-            
-            # Render environment
-            # if episode > 200:
-            #     env.render()
-
-            # Debug info
-            ql_agent.debug(DEBUG_INFO, f"Episode {episode}, Step {step}")
-            ql_agent.debug(DEBUG_INFO, f"Actions: {actions}")
-            ql_agent.debug(DEBUG_INFO, f"Rewards: {rewards}")
-            ql_agent.debug(DEBUG_INFO, f"Completed tasks: {env.completed_tasks}")
-            ql_agent.debug(DEBUG_INFO, f"Score: {score}")
-            
-            # Check if episode is done
-            if all(terminations.values() or all(truncations.values())):
-                break
-
-        # Update epsilon for exploration
-        ql_agent.update_epsilon()
-
-        # Save score
-        scores.append(score)
-
-        # Track performance metrics
-        ql_agent.episode_rewards.append(score)
-        ql_agent.completed_tasks.append(env.completed_tasks)
-
-        # Compute average loss for the episode (if any loss was recorded)
-        if ql_agent.episode_losses:
-            episode_avg_loss = np.mean(ql_agent.episode_losses)
-            avg_losses.append(episode_avg_loss)
-            print(f"Episode {episode} average loss: {episode_avg_loss:.4f}")
-        else:
-            avg_losses.append(0)
-            print(f"Episode {episode} average loss: 0.0000")
-            
-        # Log episode results
-        ql_agent.debug(DEBUG_CRITICAL, f"Episode {episode}/{n_episodes}, Score: {score}, Completed tasks: {env.completed_tasks}, Epsilon: {ql_agent.epsilon:.4f}")
-
-        # Save model periodically
-        if episode % save_every == 0:
-            ql_agent.save_model(model_path)
-            
-        # Print timing info every 10 episodes
-        if episode % 10 == 0:
-            print(f"\nTiming breakdown (avg per episode):")
-            print(f"  Environment time: {total_env_time/episode:.4f}s")
-            print(f"  Action selection time: {total_select_action_time/episode:.4f}s")
-            print(f"  Agent learning time: {total_step_time/episode:.4f}s")
-            print(f"  Episode duration: {(time.time() - episode_start):.4f}s\n")
-            
-    # Save final model
-    ql_agent.save_model(model_path)
-
-    # Plot the average loss per episode
-    plt.figure(figsize=(10, 6))
-    plt.plot(range(1, n_episodes + 1), avg_losses, marker='o', color='r', label="Avg Loss per Episode")
-    plt.xlabel("Episode")
-    plt.ylabel("Average Loss")
-    plt.title("Training Loss Progression")
-    plt.grid(True)
-    plt.legend()
-    plt.show()
-
-    # Return trained agent
-    return ql_agent
+        # Return trained agent
+        return ql_agent
 
 def run_q_learning(env, model_path=get_model_path(), n_steps=1000, debug_level=DEBUG_NONE):
     """

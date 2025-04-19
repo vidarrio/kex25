@@ -29,7 +29,7 @@ def train_DQL():
                         num_dropoff_points=4, render_mode="human")
 
     # Train DQN agent
-    train_DQN(warehouse_env, n_episodes=700, max_steps=1000, save_every=100, model_path=model_path)
+    train_DQN(warehouse_env, n_episodes=300, max_steps=1000, save_every=100, model_path=model_path)
 
 def test_a_star():
     # Create warehouse environment with rendering
