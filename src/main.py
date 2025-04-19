@@ -23,8 +23,8 @@ def eval_DQN():
 
 def train_DQL():
     # Create warehouse environments with rendering
-    simplest_env = env(grid_size=(20, 20), n_agents=2, n_humans=2, num_shelves=8, num_pickup_points=2,
-                        num_dropoff_points=4, render_mode="human")
+    simplest_env = env(grid_size=(10, 10), n_agents=1, n_humans=0, num_shelves=0, num_pickup_points=1,
+                        num_dropoff_points=1, render_mode="human")
     warehouse_env = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=6, n_humans=10, num_shelves=2048, num_pickup_points=3,
                         num_dropoff_points=4, render_mode="human")
 
@@ -33,13 +33,13 @@ def train_DQL():
 
 def test_a_star():
     # Create warehouse environment with rendering
-    simplest_env = env(grid_size=(11, 11), n_agents=1, n_humans=0, num_shelves=0, num_pickup_points=1,
+    simplest_env = env(grid_size=(20, 20), n_agents=3, n_humans=4, num_shelves=5, num_pickup_points=4,
                         num_dropoff_points=4, render_mode="human")
     warehouse_env = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=6, n_humans=5, num_shelves=2048, num_pickup_points=4,
                         num_dropoff_points=8, render_mode="human")
 
     # run_a_star(simplest_env, n_steps=1000, debug_level=5)
-    run_a_star(warehouse_env, n_steps=1000, debug_level=5)
+    run_a_star(simplest_env, n_steps=1000, debug_level=5)
 
 # Take first argument as task ("a_star" or "dqn_train" or "dqn_eval")
 def main(task):

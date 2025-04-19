@@ -49,7 +49,7 @@ class WarehouseEnv(ParallelEnv):
         # Initialize grid and agent data
         self.reset()
 
-    @functools.lru_cache(maxsize=None)
+    # @functools.lru_cache(maxsize=None)
     def action_space(self, agent):
         """
         Return the action space for a specific agent
@@ -64,7 +64,7 @@ class WarehouseEnv(ParallelEnv):
         """
         return spaces.Discrete(7)
 
-    @functools.lru_cache(maxsize=None)
+    # @functools.lru_cache(maxsize=None)
     def observation_space(self, agent):
         """
         Return the observation space for a specific agent
@@ -81,7 +81,7 @@ class WarehouseEnv(ParallelEnv):
         9. Valid pickup/drop indicator (1 if agent is at a valid pickup/drop point, 0 otherwise)
         """
 
-        obs_shape = (10,) + self.local_observation_size
+        obs_shape = (6,) + self.local_observation_size
         return spaces.Box(low=0, high=1, shape=obs_shape, dtype=np.float32)
 
     def reset(self, seed=None, options=None):
@@ -642,7 +642,7 @@ class WarehouseEnv(ParallelEnv):
         agent_pos = self.agent_positions[agent]
 
         # Initialize observation channels
-        obs = np.zeros((10,) + self.local_observation_size, dtype=np.float32)
+        obs = np.zeros((6,) + self.local_observation_size, dtype=np.float32)
 
         # Extract the local observation window (5x5 grid around the agent)
         r, c = agent_pos
@@ -660,8 +660,8 @@ class WarehouseEnv(ParallelEnv):
                 # Check if the global coordinates are within bounds
                 if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
                     # Channel 1: Agent position (only at the center)
-                    if i == 0 and j == 0:
-                        obs[0, lr, lc] = 1
+                    # if i == 0 and j == 0:
+                    #     obs[0, lr, lc] = 1
 
                     # Channel 2: Other agents' positions
                     cell_has_other_agent = False
@@ -669,25 +669,30 @@ class WarehouseEnv(ParallelEnv):
                         if other_agent != agent and self.agent_positions[other_agent] == (gr, gc):
                             cell_has_other_agent = True
                             break
-                    obs[1, lr, lc] = 1 if cell_has_other_agent else 0
+                    if cell_has_other_agent:
+                        obs[0, lr, lc] = 1
 
                     # Channel 3: Static obstacles (shelves)
-                    obs[2, lr, lc] = 1 if self.grid[gr, gc] == 2 else 0
+                    if self.grid[gr, gc] == 2:
+                        obs[0, lr, lc] = 1
 
                     # Channel 4: Dynamic obstacles
-                    obs[3, lr, lc] = 1 if self.grid[gr, gc] == 3 else 0
+                    if self.grid[gr, gc] == 3:
+                        obs[0, lr, lc] = 1    
+    
 
                     # Channel 5: Current goal position
-                    obs[4, lr, lc] = 1 if (gr, gc) == self.agent_goals[agent] else 0
+                    if (gr, gc) == self.agent_goals[agent]:
+                        obs[3, lr, lc] = 1
 
                     # Channel 6: Pickup points
-                    obs[5, lr, lc] = 1 if (gr, gc) in self.pickup_points else 0
+                    obs[1, lr, lc] = 1 if (gr, gc) in self.pickup_points else 0
 
                     # Channel 7: Dropoff points
-                    obs[6, lr, lc] = 1 if (gr, gc) in self.dropoff_points else 0
+                    obs[2, lr, lc] = 1 if (gr, gc) in self.dropoff_points else 0
 
         # Channel 8: Agent's carrying status
-        obs[7, :, :] = 1 if self.agent_carrying[agent] else 0
+        obs[4, :, :] = 1 if self.agent_carrying[agent] else 0
 
         # Channel 9: Valid pickup/drop indicator
         if self.agent_carrying[agent]:
@@ -699,7 +704,7 @@ class WarehouseEnv(ParallelEnv):
                     lr, lc = i + window_size, j + window_size
                     if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
                         if (gr, gc) == self.dropoff_points[dropoff_idx]:
-                            obs[8, lr, lc] = 1
+                            obs[5, lr, lc] = 1
         else:
             # If not carrying, mark all pickup points as valid
             for i in range(-window_size, window_size + 1):
@@ -708,44 +713,48 @@ class WarehouseEnv(ParallelEnv):
                     lr, lc = i + window_size, j + window_size
                     if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
                         if (gr, gc) in self.pickup_points:
-                            obs[8, lr, lc] = 1
+                            obs[5, lr, lc] = 1
                             
         # Channel 10: Compass-like direction to the agent's goal
         goal_pos = self.agent_goals[agent]
         goal_r, goal_c = goal_pos
         delta_r, delta_c = goal_r - r, goal_c - c
 
-        if abs(delta_r) > window_size or abs(delta_c) > window_size:
-            # Goal is outside the observation window
-            if delta_r < 0 and delta_c == 0:
-                # North
-                obs[9, 0, window_size] = 1
-            elif delta_r < 0 and delta_c > 0:
-                # Northeast
-                obs[9, 0, -1] = 1
-            elif delta_r == 0 and delta_c > 0:
-                # East
-                obs[9, window_size, -1] = 1
-            elif delta_r > 0 and delta_c > 0:
-                # Southeast
-                obs[9, -1, -1] = 1
-            elif delta_r > 0 and delta_c == 0:
-                # South
-                obs[9, -1, window_size] = 1
-            elif delta_r > 0 and delta_c < 0:
-                # Southwest
-                obs[9, -1, 0] = 1
-            elif delta_r == 0 and delta_c < 0:
-                # West
-                obs[9, window_size, 0] = 1
-            elif delta_r < 0 and delta_c < 0:
-                # Northwest
-                obs[9, 0, 0] = 1
-        else:
-            # Goal is within the observation window
-            direction_r = delta_r + window_size
-            direction_c = delta_c + window_size
-            obs[9, direction_r, direction_c] = 1
+        
+        # Goal is outside the observation window
+        if delta_r < 0 and delta_c == 0:
+
+            obs[3, 0, window_size] = 1
+        elif delta_r < 0 and delta_c > 0:
+
+            obs[3, 0, -1] = 1
+        elif delta_r == 0 and delta_c > 0:
+
+            obs[3, window_size, -1] = 1
+        elif delta_r > 0 and delta_c > 0:
+
+            obs[3, -1, -1] = 1
+        elif delta_r > 0 and delta_c == 0:
+
+            obs[3, -1, window_size] = 1
+        elif delta_r > 0 and delta_c < 0:
+
+            obs[3, -1, 0] = 1
+        elif delta_r == 0 and delta_c < 0:
+
+            obs[3, window_size, 0] = 1
+        elif delta_r < 0 and delta_c < 0:
+
+            obs[3, 0, 0] = 1
+        
+            
+        # print(f"\nAgent {agent} - Direction to goal: {direction}")
+        # for row in range(len(obs[9])):
+        #     print("")
+        #     for col in range(len(obs[9][row])):
+        #         fig = "·" if obs[9][row][col] == 0 else "X"
+        #         print(f"{fig:^5}", end=" ")
+        
         return obs
     
     def _get_human_observation(self, human):

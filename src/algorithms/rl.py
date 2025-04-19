@@ -180,7 +180,7 @@ class QLAgent:
 
         # Get observation shape from environment
         observation_shape = env.observation_size
-        observation_channels = 10
+        observation_channels = 6
 
         # State and action dimentions
         self.state_size = (observation_channels, *observation_shape)
@@ -261,9 +261,9 @@ class QLAgent:
         """
 
         # Check if agent is at a pickup or dropoff point
-        is_at_pickup = state[5, 2, 2] > 0.5
-        is_at_dropoff = state[6, 2, 2] > 0.5
-        is_carrying = state[7, 2, 2] > 0.5
+        is_at_pickup = state[1, 2, 2] > 0.5
+        is_at_dropoff = state[2, 2, 2] > 0.5
+        is_carrying = state[4, 2, 2] > 0.5
 
         # When at goal states, reduce exploration
         if eval_mode or self.epsilon < 0.3:
@@ -302,9 +302,9 @@ class QLAgent:
         is_at_dropoff = {}
         is_carrying = {}
         for agent in self.env.agents:
-            is_at_pickup[agent] = observations[agent][5, 2, 2] > 0.5
-            is_at_dropoff[agent] = observations[agent][6, 2, 2] > 0.5
-            is_carrying[agent] = observations[agent][7, 2, 2] > 0.5
+            is_at_pickup[agent] = observations[agent][1, 2, 2] > 0.5
+            is_at_dropoff[agent] = observations[agent][2, 2, 2] > 0.5
+            is_carrying[agent] = observations[agent][4, 2, 2] > 0.5
 
         # When at goal states, reduce exploration
         for agent in self.env.agents:
@@ -512,6 +512,10 @@ def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
                 # Render environment
                 # if episode > 200:
                 #     env.render()
+                    
+                
+                    
+                
 
                 # Debug info
                 ql_agent.debug(DEBUG_INFO, f"Episode {episode}, Step {step}")
@@ -560,6 +564,7 @@ def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
                 print(f"  Agent learning time: {total_step_time/episode:.4f}s")
                 print(f"  Episode duration: {(time.time() - episode_start):.4f}s\n")
     except Exception as e:
+        print(e)
         pass
     finally:
         # Save final model
