@@ -157,7 +157,7 @@ class QLAgent:
     def __init__(self, env, debug_level=DEBUG_NONE,
                  alpha=0.001, gamma=0.99, epsilon_start=1.0, epsilon_end=0.1,
                  epsilon_decay=0.99, hidden_size=64, buffer_size=20000, batch_size=64,
-                 update_freq=8, tau=0.005):
+                 update_freq=8, tau=0.001):
         """
         Initialize the Q-learning agent.
 
@@ -173,7 +173,7 @@ class QLAgent:
             buffer_size: Size of the replay buffer (default: 10000).
             batch_size: Size of the training batch (default: 64).
             update_freq: Frequency of model updates (default: 4).
-            tau: Target network update rate (default: 0.01).
+            tau: Target network update rate (default: 0.001).
         """
         
         self.env = env
@@ -494,11 +494,14 @@ class QLAgent:
         # Compute gradients (backpropagation)
         loss.backward()
 
+        # Clip gradients to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(self.q_networks[agent].parameters(), max_norm=1.0)
+
         # Update based on gradients
         self.optimizers[agent].step()
 
         # Update target network
-        if self.t_step % (self.update_freq * 10) == 0:
+        if self.t_step % self.update_freq == 0:
             self._soft_update(self.q_networks[agent], self.target_networks[agent], self.tau)
 
     def _soft_update(self, local_model, target_model, tau):
