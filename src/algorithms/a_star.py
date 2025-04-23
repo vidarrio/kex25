@@ -750,14 +750,14 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
                     a_star_agent.debug(DEBUG_CRITICAL, f"{agent} has reached its goal!")
         
         # Render the environment
-        env.render()
+        # env.render()
         
         # Print info
         a_star_agent.debug(DEBUG_INFO, f"Rewards: {rewards}")
         a_star_agent.debug(DEBUG_INFO, f"Completed tasks: {env.completed_tasks}")
         
         # Slow down simulation
-        time.sleep(0.1)
+        # time.sleep(0.1)
         
         # Check for replanning
         replan = any(a_star_agent.need_replanning.values())

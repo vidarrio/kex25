@@ -24,10 +24,13 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
 # Get path to models directory (src/models)
-def get_model_path():
+def get_model_path(path=None):
     current_dir = os.path.dirname(os.path.abspath(__file__))
     models_dir = os.path.join(current_dir, '..', 'models')
-    model_name = 'q_learning_model.pth'
+    if path:
+        model_name = path
+    else:
+        model_name = 'q_learning_model.pth'
     model_path = os.path.join(models_dir, model_name)
     return model_path
 
@@ -154,9 +157,9 @@ class QLAgent:
 
 
     def __init__(self, env, debug_level=DEBUG_NONE,
-                 alpha=0.001, gamma=0.99, epsilon_start=1.0, epsilon_end=0.1,
-                 epsilon_decay=0.995, hidden_size=64, buffer_size=50000, batch_size=128,
-                 update_freq=4, tau=0.005):
+                 alpha=0.00005, gamma=0.99, epsilon_start=1.0, epsilon_end=0.1,
+                 epsilon_decay=0.9985, hidden_size=64, buffer_size=1000000, batch_size=128,
+                 update_freq=8, tau=0.001):
         """
         Initialize the Q-learning agent.
 
@@ -180,23 +183,19 @@ class QLAgent:
 
         # Get observation shape from environment
         observation_shape = env.observation_size
-        observation_channels = 6
+        observation_channels = 10
 
         # State and action dimentions
         self.state_size = (observation_channels, *observation_shape)
         self.action_size = 7 # 4 movement, 3 actions (pickup, dropoff, wait)
 
-        # Initialize Q-networks for each agent
-        self.q_networks = {}
-        self.target_networks = {}
-        self.optimizers = {}
-
-        for agent in env.agents:
-            self.q_networks[agent] = QNetwork(self.state_size, self.action_size, hidden_size).to(device)
-            self.target_networks[agent] = QNetwork(self.state_size, self.action_size, hidden_size).to(device)
-            # Copy weights from Q-network to target network
-            self.target_networks[agent].load_state_dict(self.q_networks[agent].state_dict())
-            self.optimizers[agent] = torch.optim.Adam(self.q_networks[agent].parameters(), lr=alpha)
+        # Shared Q-network and target network
+        self.q_network = QNetwork(self.state_size, self.action_size, hidden_size).to(device)
+        self.target_network = QNetwork(self.state_size, self.action_size, hidden_size).to(device)
+        # Initialize target with same weights
+        self.target_network.load_state_dict(self.q_network.state_dict())
+        # Single optimizer
+        self.optimizer = torch.optim.Adam(self.q_network.parameters(), lr=alpha)
 
         # Initialize replay buffer
         self.memory = ReplayBuffer(buffer_size, batch_size)
@@ -238,7 +237,7 @@ class QLAgent:
         for agent in self.env.agents:
             if agent in states and agent in next_state:
                 self.memory.add(
-                    states[agent], 
+                    states[agent],
                     action[agent],
                     reward[agent],
                     next_state[agent],
@@ -250,20 +249,18 @@ class QLAgent:
         if self.t_step % self.update_freq == 0 and len(self.memory) >= self.batch_size:
             # Sample a batch of experiences
             experiences = self.memory.sample()
+            # Learn using the shared network
+            self._learn(experiences)
 
-            # learn for each agent
-            for agent in self.env.agents:
-                self._learn(agent, experiences) 
-
-    def select_action(self, state, agent, eval_mode=False):
+    def select_action(self, state, eval_mode=False):
         """
         Return action for given state using epsilon-greedy policy.
         """
 
         # Check if agent is at a pickup or dropoff point
-        is_at_pickup = state[1, 2, 2] > 0.5
-        is_at_dropoff = state[2, 2, 2] > 0.5
-        is_carrying = state[4, 2, 2] > 0.5
+        is_at_pickup = state[5, 2, 2] > 0.5
+        is_at_dropoff = state[6, 2, 2] > 0.5
+        is_carrying = state[7, 2, 2] > 0.5
 
         # When at goal states, reduce exploration
         if eval_mode or self.epsilon < 0.3:
@@ -271,8 +268,7 @@ class QLAgent:
                 return 4
             elif is_at_dropoff and is_carrying:
                 return 5
-            
-        
+
         # Check if we should explore
         if not eval_mode and random.random() < self.epsilon:
             # Explore: select random action
@@ -282,7 +278,7 @@ class QLAgent:
         state_tensor = torch.from_numpy(state).float().unsqueeze(0).to(device)
 
         with torch.no_grad():
-            action_values = self.q_networks[agent](state_tensor)
+            action_values = self.q_network(state_tensor)
 
         # Exploit: select action with highest Q-value
         return int(torch.argmax(action_values).item())
@@ -302,9 +298,9 @@ class QLAgent:
         is_at_dropoff = {}
         is_carrying = {}
         for agent in self.env.agents:
-            is_at_pickup[agent] = observations[agent][1, 2, 2] > 0.5
-            is_at_dropoff[agent] = observations[agent][2, 2, 2] > 0.5
-            is_carrying[agent] = observations[agent][4, 2, 2] > 0.5
+            is_at_pickup[agent] = observations[agent][5, 2, 2] > 0.5
+            is_at_dropoff[agent] = observations[agent][6, 2, 2] > 0.5
+            is_carrying[agent] = observations[agent][7, 2, 2] > 0.5
 
         # When at goal states, reduce exploration
         for agent in self.env.agents:
@@ -334,12 +330,10 @@ class QLAgent:
             state_batch = torch.from_numpy(np.stack(states)).float().to(device)
 
             with torch.no_grad():
-                # Forward pass
-                action_values = [self.q_networks[agent](state_batch[i:i+1]) for i, agent in enumerate(agents)]
-
-                # Select best action
+                # Batch forward on shared network
+                action_values_batch = self.q_network(state_batch)
                 for i, agent in enumerate(agents):
-                    actions[agent] = int(torch.argmax(action_values[i]).item())
+                    actions[agent] = int(torch.argmax(action_values_batch[i:i+1]).item())
 
         return actions
 
@@ -355,29 +349,22 @@ class QLAgent:
         """
         Save the Q-network model to the specified path.
         """
-
-        model_data = {
-            agent: self.q_networks[agent].state_dict()
-            for agent in self.env.agents
-        }
-        torch.save(model_data, model_path)
+        torch.save(self.q_network.state_dict(), model_path)
 
     def load_model(self, filepath=get_model_path()):
         """
         Load the Q-network model from the specified path.
         """
+        state_dict = torch.load(filepath, map_location=device)
+        self.q_network.load_state_dict(state_dict)
+        self.target_network.load_state_dict(state_dict)
 
-        model_data = torch.load(filepath, map_location=device)
-        for agent in self.env.agents:
-            self.q_networks[agent].load_state_dict(model_data[agent])
-            self.target_networks[agent].load_state_dict(model_data[agent])
-        
-    def _learn(self, agent, experiences=None):
+    def _learn(self, experiences=None):
         """
         Update Q-network using sampled experiences.
         """
 
-        # If sample is not provied
+        # If sample is not provided
         if experiences is None:
             # Only learn if enough samples are available
             if len(self.memory) < self.batch_size:
@@ -386,18 +373,16 @@ class QLAgent:
             states, actions, rewards, next_states, dones = self.memory.sample()
         else:
             states, actions, rewards, next_states, dones = experiences
-        
+
         # Get Q-values from local and target networks - batch processing
-        q_values = self.q_networks[agent](states).gather(1, actions)
+        q_values = self.q_network(states).gather(1, actions)
 
         # Only compute next_q_values if gamma > 0
         if self.gamma > 0:
             # Get Q-values from target network
             with torch.no_grad():
-# Get actions from current policy network
-                next_actions = self.q_networks[agent](next_states).argmax(1, keepdim=True)
-                # Get Q-values from target network for those actions
-                next_q_values = self.target_networks[agent](next_states).gather(1, next_actions)
+                next_actions = self.q_network(next_states).argmax(1, keepdim=True)
+                next_q_values = self.target_network(next_states).gather(1, next_actions)
                 targets = rewards + (self.gamma * next_q_values * (1 - dones))
         else:
             # If gamma is 0, use rewards directly
@@ -409,17 +394,19 @@ class QLAgent:
         self.episode_losses.append(loss.item())
 
         # Zero gradients (reset gradients)
-        self.optimizers[agent].zero_grad(set_to_none=True)
+        self.optimizer.zero_grad(set_to_none=True)
 
         # Compute gradients (backpropagation)
         loss.backward()
+        # gradient clipping to stabilize updates
+        torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), max_norm=5.0)
 
         # Update based on gradients
-        self.optimizers[agent].step()
+        self.optimizer.step()
 
         # Update target network
         if self.t_step % (self.update_freq * 10) == 0:
-            self._soft_update(self.q_networks[agent], self.target_networks[agent], self.tau)
+            self._soft_update(self.q_network, self.target_network, self.tau)
 
     def _soft_update(self, local_model, target_model, tau):
         """
@@ -435,7 +422,7 @@ def check_gpu_usage():
         print(f"Memory allocated: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
         print(f"Memory cached: {torch.cuda.memory_reserved(0) / 1e9:.2f} GB")
 
-def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, save_every=100, model_path=get_model_path()):
+def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, save_every=100, model_path=get_model_path(), load_path=None):
     """
     Train Q-learning agent in the warehouse environment.
     
@@ -464,11 +451,20 @@ def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
 
     # Initialize agent
     ql_agent = QLAgent(env, debug_level=debug_level)
+    
+    #load model if it exists
+    try:
+        ql_agent.load_model(load_path)
+        print(f"Loaded trained model from {load_path}")
+    except FileNotFoundError:
+        print(f"Model file not found at {load_path}. Using untrained agent.")
 
     # Track scores
     scores = []
     avg_losses = []  # list to store average loss per episode
     avg_score = []
+    avg_deliveries = []  # list to store average deliveries per robot per episode
+    epsilons = []        # list to store epsilon value at end of each episode
 
     # Add timing variables
     total_env_time = 0
@@ -510,7 +506,7 @@ def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
                 observations = next_observations
                 
                 # Render environment
-                # if episode > 200:
+                # if episode > 600:
                 #     env.render()
                     
                 
@@ -530,6 +526,9 @@ def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
 
             # Update epsilon for exploration
             ql_agent.update_epsilon()
+            # Record average deliveries and epsilon after this episode
+            avg_deliveries.append(sum(env.completed_tasks.values()) / len(env.agents))
+            epsilons.append(ql_agent.epsilon)
 
             # Save score
             scores.append(score)
@@ -573,7 +572,9 @@ def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
         # Save training metrics (average losses and scores) to a JSON file
         metrics = {
             "avg_losses": avg_losses,
-            "avg_score": avg_score
+            "avg_score": avg_score,
+            "avg_deliveries": avg_deliveries,
+            "epsilons": epsilons
         }
         current_time = time.strftime("%Y%m%d-%H%M%S")
         metrics_file = f'{model_path}_training_metrics__{current_time}.json'
@@ -581,14 +582,20 @@ def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
             json.dump(metrics, f)
         print(f"Training metrics saved to {metrics_file}")
         
-        # Uncomment the code below to generate and save plots when needed:
-        plt.figure()
-        plt.subplot(2, 1, 1)
+        # Plot loss, score, deliveries, and epsilon over episodes
+        plt.figure(figsize=(10, 12))
+        plt.subplot(4, 1, 1)
         plt.plot(avg_losses)
         plt.title("Average Q Loss per Episode")
-        plt.subplot(2, 1, 2)
+        plt.subplot(4, 1, 2)
         plt.plot(avg_score)
         plt.title("Average Score per Episode")
+        plt.subplot(4, 1, 3)
+        plt.plot(avg_deliveries)
+        plt.title("Average Deliveries per Robot per Episode")
+        plt.subplot(4, 1, 4)
+        plt.plot(epsilons)
+        plt.title("Epsilon Value per Episode")
         plt.tight_layout()
         plot_file = f'{model_path}_training_metrics__{current_time}.png'
         plt.savefig(plot_file)
@@ -628,7 +635,7 @@ def run_q_learning(env, model_path=get_model_path(), n_steps=1000, debug_level=D
         actions = {}
         for agent in env.agents:
             state = observations[agent]
-            actions[agent] = QL_agent.select_action(state, agent, eval_mode=True)
+            actions[agent] = QL_agent.select_action(state, eval_mode=True)
 
         # Take actions in the environment
         observations, rewards, terminations, truncations, infos = env.step(actions)
@@ -642,7 +649,6 @@ def run_q_learning(env, model_path=get_model_path(), n_steps=1000, debug_level=D
         print(f"Rewards: {rewards}")
         print(f"Completed tasks: {env.completed_tasks}")
 
-        # Check if done
         if all(terminations.values()) or all(truncations.values()):
             break
 

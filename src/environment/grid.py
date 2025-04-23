@@ -16,7 +16,7 @@ class WarehouseEnv(ParallelEnv):
     metadata = {'render_modes': ['human', 'rgb_array'], 'name': 'warehouse_v0'}
 
     def __init__(self, grid_size=(20, 20), human_grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, 
-                 num_pickup_points=3, num_dropoff_points=2, collision_penalty=-100, task_reward=10, step_cost=-100,
+                 num_pickup_points=3, num_dropoff_points=2, collision_penalty=-50, task_reward=100, step_cost=-50,
                  observation_size=(5, 5), render_mode=None):
         super().__init__()
 
@@ -33,6 +33,10 @@ class WarehouseEnv(ParallelEnv):
         self.task_reward = task_reward
         self.step_cost = step_cost
         self.render_mode = render_mode
+        
+        self.wrong_pickup_penalty = -50
+        self.step_closer_reward = 50
+        self.wrong_dropoff_penalty = -50
 
         # Create list of possible agents
         self.possible_agents = ["agent_" + str(i) for i in range(self.n_agents)]
@@ -81,7 +85,7 @@ class WarehouseEnv(ParallelEnv):
         9. Valid pickup/drop indicator (1 if agent is at a valid pickup/drop point, 0 otherwise)
         """
 
-        obs_shape = (6,) + self.local_observation_size
+        obs_shape = (10,) + self.local_observation_size
         return spaces.Box(low=0, high=1, shape=obs_shape, dtype=np.float32)
 
     def reset(self, seed=None, options=None):
@@ -642,7 +646,7 @@ class WarehouseEnv(ParallelEnv):
         agent_pos = self.agent_positions[agent]
 
         # Initialize observation channels
-        obs = np.zeros((6,) + self.local_observation_size, dtype=np.float32)
+        obs = np.zeros((10,) + self.local_observation_size, dtype=np.float32)
 
         # Extract the local observation window (5x5 grid around the agent)
         r, c = agent_pos
@@ -660,8 +664,8 @@ class WarehouseEnv(ParallelEnv):
                 # Check if the global coordinates are within bounds
                 if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
                     # Channel 1: Agent position (only at the center)
-                    # if i == 0 and j == 0:
-                    #     obs[0, lr, lc] = 1
+                    if i == 0 and j == 0:
+                        obs[0, lr, lc] = 1
 
                     # Channel 2: Other agents' positions
                     cell_has_other_agent = False
@@ -669,30 +673,25 @@ class WarehouseEnv(ParallelEnv):
                         if other_agent != agent and self.agent_positions[other_agent] == (gr, gc):
                             cell_has_other_agent = True
                             break
-                    if cell_has_other_agent:
-                        obs[0, lr, lc] = 1
+                    obs[1, lr, lc] = 1 if cell_has_other_agent else 0
 
                     # Channel 3: Static obstacles (shelves)
-                    if self.grid[gr, gc] == 2:
-                        obs[0, lr, lc] = 1
+                    obs[2, lr, lc] = 1 if self.grid[gr, gc] == 2 else 0
 
                     # Channel 4: Dynamic obstacles
-                    if self.grid[gr, gc] == 3:
-                        obs[0, lr, lc] = 1    
-    
+                    obs[3, lr, lc] = 1 if self.grid[gr, gc] == 3 else 0
 
                     # Channel 5: Current goal position
-                    if (gr, gc) == self.agent_goals[agent]:
-                        obs[3, lr, lc] = 1
+                    obs[4, lr, lc] = 1 if (gr, gc) == self.agent_goals[agent] else 0
 
                     # Channel 6: Pickup points
-                    obs[1, lr, lc] = 1 if (gr, gc) in self.pickup_points else 0
+                    obs[5, lr, lc] = 1 if (gr, gc) in self.pickup_points else 0
 
                     # Channel 7: Dropoff points
-                    obs[2, lr, lc] = 1 if (gr, gc) in self.dropoff_points else 0
+                    obs[6, lr, lc] = 1 if (gr, gc) in self.dropoff_points else 0
 
         # Channel 8: Agent's carrying status
-        obs[4, :, :] = 1 if self.agent_carrying[agent] else 0
+        obs[7, :, :] = 1 if self.agent_carrying[agent] else 0
 
         # Channel 9: Valid pickup/drop indicator
         if self.agent_carrying[agent]:
@@ -704,7 +703,7 @@ class WarehouseEnv(ParallelEnv):
                     lr, lc = i + window_size, j + window_size
                     if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
                         if (gr, gc) == self.dropoff_points[dropoff_idx]:
-                            obs[5, lr, lc] = 1
+                            obs[8, lr, lc] = 1
         else:
             # If not carrying, mark all pickup points as valid
             for i in range(-window_size, window_size + 1):
@@ -713,7 +712,7 @@ class WarehouseEnv(ParallelEnv):
                     lr, lc = i + window_size, j + window_size
                     if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
                         if (gr, gc) in self.pickup_points:
-                            obs[5, lr, lc] = 1
+                            obs[8, lr, lc] = 1
                             
         # Channel 10: Compass-like direction to the agent's goal
         goal_pos = self.agent_goals[agent]
@@ -724,28 +723,28 @@ class WarehouseEnv(ParallelEnv):
         # Goal is outside the observation window
         if delta_r < 0 and delta_c == 0:
 
-            obs[3, 0, window_size] = 1
+            obs[9, 0, window_size] = 1
         elif delta_r < 0 and delta_c > 0:
 
-            obs[3, 0, -1] = 1
+            obs[9, 0, -1] = 1
         elif delta_r == 0 and delta_c > 0:
 
-            obs[3, window_size, -1] = 1
+            obs[9, window_size, -1] = 1
         elif delta_r > 0 and delta_c > 0:
 
-            obs[3, -1, -1] = 1
+            obs[9, -1, -1] = 1
         elif delta_r > 0 and delta_c == 0:
 
-            obs[3, -1, window_size] = 1
+            obs[9, -1, window_size] = 1
         elif delta_r > 0 and delta_c < 0:
 
-            obs[3, -1, 0] = 1
+            obs[9, -1, 0] = 1
         elif delta_r == 0 and delta_c < 0:
 
-            obs[3, window_size, 0] = 1
+            obs[9, window_size, 0] = 1
         elif delta_r < 0 and delta_c < 0:
 
-            obs[3, 0, 0] = 1
+            obs[9, 0, 0] = 1
         
             
         # print(f"\nAgent {agent} - Direction to goal: {direction}")
@@ -810,7 +809,7 @@ class WarehouseEnv(ParallelEnv):
         """
 
         # Create a full grid representation with multiple channels
-        global_state = np.zeros((6,) + self.grid_size, dtype=np.float32)
+        global_state = np.zeros((9,) + self.grid_size, dtype=np.float32)
 
         # Channel 0: All agents' positions (combines 'agent position' and 'other agents' positions')
         for agent, pos in self.agent_positions.items():
@@ -1005,7 +1004,7 @@ class WarehouseEnv(ParallelEnv):
             prev_dist = abs(prev_pos[0] - goal[0]) + abs(prev_pos[1] - goal[1])
             curr_dist = abs(current_pos[0] - goal[0]) + abs(current_pos[1] - goal[1])
             if curr_dist < prev_dist:
-                rewards[agent] += 5
+                rewards[agent] += self.step_closer_reward
             
 
         # Handle pickup action (4)
@@ -1027,7 +1026,7 @@ class WarehouseEnv(ParallelEnv):
 
                 else:
                     # Wrong pickup point, small penalty
-                    rewards[agent] += -100
+                    rewards[agent] += self.wrong_pickup_penalty
 
         # Handle dropoff action (5)
         elif action == 5:
@@ -1046,7 +1045,7 @@ class WarehouseEnv(ParallelEnv):
                     self._assign_new_goal(agent)
                 else:
                     # Wrong dropoff point, small penalty
-                    rewards[agent] += -100
+                    rewards[agent] += self.wrong_dropoff_penalty
 
         # Handle wait action (6)
         elif action == 6:

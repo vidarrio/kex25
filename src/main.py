@@ -3,13 +3,18 @@ from environment import env
 from algorithms import run_a_star, run_q_learning, train_DQN
 import os
 
-CURRENT_VERSION = "v1.2.1"
+LOAD_MODEL = "v1.0.0-simpliest_env-10x10,1agent,0human,0shelf,1pickup,1dropoff"
+CURRENT_VERSION = "v2.0.0-simple_env-20x20,1agent,0human,0shelf,1pickup,1dropoff"
 
 # Construct path to the model directory
 current_dir = os.path.dirname(os.path.abspath(__file__))
 models_dir = os.path.join(current_dir, 'models')
 model_name = CURRENT_VERSION + ".pth"
 model_path = os.path.join(models_dir, model_name)
+
+# Construct path to to load the model
+load_model_name = LOAD_MODEL + ".pth"
+load_path = os.path.join(models_dir, load_model_name)
 
 
 def eval_DQN():
@@ -25,11 +30,15 @@ def train_DQL():
     # Create warehouse environments with rendering
     simplest_env = env(grid_size=(10, 10), n_agents=1, n_humans=0, num_shelves=0, num_pickup_points=1,
                         num_dropoff_points=1, render_mode="human")
-    warehouse_env = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=6, n_humans=10, num_shelves=2048, num_pickup_points=3,
+    simple_env = env(grid_size=(20, 20), n_agents=1, n_humans=0, num_shelves=0, num_pickup_points=1,
+                        num_dropoff_points=1, render_mode="human")
+    simple_shelves = env(grid_size=(10, 14), n_agents=1, n_humans=0, num_shelves=32, num_pickup_points=1,
+                        num_dropoff_points=4, render_mode="human")
+    warehouse_env = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=5, n_humans=10, num_shelves=2048, num_pickup_points=3,
                         num_dropoff_points=4, render_mode="human")
 
     # Train DQN agent
-    train_DQN(warehouse_env, n_episodes=300, max_steps=1000, save_every=100, model_path=model_path)
+    train_DQN(simple_env, n_episodes=1000, max_steps=1000, save_every=100, model_path=model_path, load_path=load_path)
 
 def test_a_star():
     # Create warehouse environment with rendering
@@ -39,7 +48,7 @@ def test_a_star():
                         num_dropoff_points=8, render_mode="human")
 
     # run_a_star(simplest_env, n_steps=1000, debug_level=5)
-    run_a_star(simplest_env, n_steps=1000, debug_level=5)
+    run_a_star(warehouse_env, n_steps=1000, debug_level=5)
 
 # Take first argument as task ("a_star" or "dqn_train" or "dqn_eval")
 def main(task):
