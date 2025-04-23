@@ -3,8 +3,8 @@ from environment import env
 from algorithms import run_a_star, run_q_learning, train_DQN
 import os
 
-LOAD_MODEL = "v2.0.0-simple_env-20x20,1agent,0human,0shelf,1pickup,1dropoff"
-CURRENT_VERSION = "v3.0.0-simple_env_multiple_agent-20x20,2agent,0human,0shelf,1pickup,1dropoff"
+LOAD_MODEL = "v3.0.0-simple_env_multiple_agent-10x10,2agent,0human,0shelf,1pickup,1dropoff"
+CURRENT_VERSION = "v4.0.0-simple_env_multiple_drop_pickup-10x10,2agent,0human,0shelf,4pickup,8dropoff"
 
 # Construct path to the model directory
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -37,14 +37,22 @@ def train_DQL():
     simple_env_multiple_agents = env(grid_size=(10, 10), n_agents=2, n_humans=0, num_shelves=0, num_pickup_points=1,
                         num_dropoff_points=1, render_mode="human")
     
+    simple_env_multiple_drop_pickup = env(grid_size=(10, 10), n_agents=2, n_humans=0, num_shelves=0, num_pickup_points=4,
+                        num_dropoff_points=8, render_mode="human")
+    
     simple_shelves = env(grid_size=(10, 14), n_agents=1, n_humans=0, num_shelves=32, num_pickup_points=1,
                         num_dropoff_points=4, render_mode="human")
     
     warehouse_env = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=5, n_humans=10, num_shelves=2048, num_pickup_points=3,
                         num_dropoff_points=4, render_mode="human")
+    
+    # curriculum = [simplest_env, simple_env, simple_env_multiple_agents, simple_shelves, warehouse_env]
+    curriculum = [simplest_env, simple_env, simple_env_multiple_agents, simple_shelves, warehouse_env]
+    
+        
 
     # Train DQN agent
-    train_DQN(simple_env_multiple_agents, n_episodes=1000, max_steps=1000, save_every=100, model_path=model_path, load_path=load_path)
+    train_DQN(simple_env_multiple_drop_pickup, n_episodes=1000, max_steps=1000, save_every=100, model_path=model_path, load_path=load_path)
 
 def test_a_star():
     # Create warehouse environment with rendering
