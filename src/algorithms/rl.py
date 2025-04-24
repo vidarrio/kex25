@@ -258,16 +258,16 @@ class QLAgent:
         """
 
         # Check if agent is at a pickup or dropoff point
-        is_at_pickup = state[5, 2, 2] > 0.5
-        is_at_dropoff = state[6, 2, 2] > 0.5
-        is_carrying = state[7, 2, 2] > 0.5
+        # is_at_pickup = state[5, 2, 2] > 0.5
+        # is_at_dropoff = state[6, 2, 2] > 0.5
+        # is_carrying = state[7, 2, 2] > 0.5
 
-        # When at goal states, reduce exploration
-        if eval_mode or self.epsilon < 0.3:
-            if is_at_pickup and not is_carrying:
-                return 4
-            elif is_at_dropoff and is_carrying:
-                return 5
+        # # When at goal states, reduce exploration
+        # if eval_mode or self.epsilon < 0.3:
+        #     if is_at_pickup and not is_carrying:
+        #         return 4
+        #     elif is_at_dropoff and is_carrying:
+        #         return 5
 
         # Check if we should explore
         if not eval_mode and random.random() < self.epsilon:
@@ -294,21 +294,21 @@ class QLAgent:
 
         # For each agent, check if we're on a pickup or dropoff point
         # and if we are carrying an item
-        is_at_pickup = {}
-        is_at_dropoff = {}
-        is_carrying = {}
-        for agent in self.env.agents:
-            is_at_pickup[agent] = observations[agent][5, 2, 2] > 0.5
-            is_at_dropoff[agent] = observations[agent][6, 2, 2] > 0.5
-            is_carrying[agent] = observations[agent][7, 2, 2] > 0.5
+        # is_at_pickup = {}
+        # is_at_dropoff = {}
+        # is_carrying = {}
+        # for agent in self.env.agents:
+        #     is_at_pickup[agent] = observations[agent][5, 2, 2] > 0.5
+        #     is_at_dropoff[agent] = observations[agent][6, 2, 2] > 0.5
+        #     is_carrying[agent] = observations[agent][7, 2, 2] > 0.5
 
-        # When at goal states, reduce exploration
-        for agent in self.env.agents:
-            if self.epsilon < 0.3:
-                if is_at_pickup[agent] and not is_carrying[agent]:
-                    actions[agent] = 4
-                elif is_at_dropoff[agent] and is_carrying[agent]:
-                    actions[agent] = 5
+        # # When at goal states, reduce exploration
+        # for agent in self.env.agents:
+        #     if self.epsilon < 0.3:
+        #         if is_at_pickup[agent] and not is_carrying[agent]:
+        #             actions[agent] = 4
+        #         elif is_at_dropoff[agent] and is_carrying[agent]:
+        #             actions[agent] = 5
 
         # Determine which agents need network evaluation vs random actions when agent is not in actions
         for agent in self.env.agents:

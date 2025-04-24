@@ -30,22 +30,28 @@ def eval_DQN():
 
 def train_DQL():
     # Create warehouse environments with rendering
-    v1_simplest_env_10x10_1agent_0human_0shelves_1pickup_1dropoff = env(grid_size=(10, 10), n_agents=1, n_humans=0, num_shelves=0, num_pickup_points=1,
+    v1_simplest_env_10x10_1agent_0human_0shelves_1pickup_1dropoff = env(grid_size=(10, 10), human_grid_size=(10, 10), n_agents=1, n_humans=0, num_shelves=0, num_pickup_points=1,
                         num_dropoff_points=1, render_mode="human")
     
-    v2_simple_env_20x20_1agent_0human_0shelves_1pickup_1dropoff = env(grid_size=(20, 20), n_agents=1, n_humans=0, num_shelves=0, num_pickup_points=1,
+    v2_simple_env_20x20_1agent_0human_0shelves_1pickup_1dropoff = env(grid_size=(20, 20), human_grid_size=(20, 20), n_agents=1, n_humans=0, num_shelves=0, num_pickup_points=1,
                         num_dropoff_points=1, render_mode="human")
     
-    v3_simple_env_multiple_agents_10x10_2agent_0human_0shelves_1pickup_1dropoff = env(grid_size=(10, 10), n_agents=2, n_humans=0, num_shelves=0, num_pickup_points=1,
+    v3_simple_env_multiple_agents_10x10_2agent_0human_0shelves_1pickup_1dropoff = env(grid_size=(10, 10), human_grid_size=(10, 10), n_agents=2, n_humans=0, num_shelves=0, num_pickup_points=1,
                         num_dropoff_points=1, render_mode="human")
     
-    v4_simple_env_multiple_drop_pickup_10x10_2agent_0human_0shelves_4_pickup_8dropoff = env(grid_size=(10, 10), n_agents=2, n_humans=0, num_shelves=0, num_pickup_points=4,
+    v4_simple_env_multiple_drop_pickup_10x10_2agent_0human_0shelves_4_pickup_8dropoff = env(grid_size=(10, 10), human_grid_size=(10, 10), n_agents=2, n_humans=0, num_shelves=0, num_pickup_points=4,
                         num_dropoff_points=8, render_mode="human")
     
-    v5_simple_shelves_10x14_1agent_0human_32shelves_2pickup_4_dropoff = env(grid_size=(10, 14), n_agents=1, n_humans=0, num_shelves=32, num_pickup_points=2,
+    v5_simple_shelves_10x14_1agent_0human_32shelves_2pickup_4_dropoff = env(grid_size=(10, 14), human_grid_size=(10, 14), n_agents=1, n_humans=0, num_shelves=32, num_pickup_points=2,
                         num_dropoff_points=4, render_mode="human")
     
-    v6_warehouse_env = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=5, n_humans=10, num_shelves=2048, num_pickup_points=3,
+    v6_simple_human_10x10_1agent_5human_0shelves_2pickup_4_dropoff = env(grid_size=(10, 10), human_grid_size=(10, 10), n_agents=1, n_humans=5, num_shelves=0, num_pickup_points=2,
+                        num_dropoff_points=4, render_mode="human")
+    
+    v7_simple_human_and_shelves_10x14_1agent_5human_32shelves_2pickup_4_dropoff = env(grid_size=(10, 14), human_grid_size=(10, 14), n_agents=1, n_humans=5, num_shelves=32, num_pickup_points=2,
+                        num_dropoff_points=4, render_mode="human")
+    
+    v8_warehouse_env = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=5, n_humans=10, num_shelves=2048, num_pickup_points=3,
                         num_dropoff_points=4, render_mode="human")
     
     # curriculum = [simplest_env, simple_env, simple_env_multiple_agents, simple_shelves, warehouse_env]
@@ -53,18 +59,22 @@ def train_DQL():
                   v2_simple_env_20x20_1agent_0human_0shelves_1pickup_1dropoff, 
                   v3_simple_env_multiple_agents_10x10_2agent_0human_0shelves_1pickup_1dropoff, 
                   v4_simple_env_multiple_drop_pickup_10x10_2agent_0human_0shelves_4_pickup_8dropoff, 
-                  v5_simple_shelves_10x14_1agent_0human_32shelves_2pickup_4_dropoff, 
-                  v6_warehouse_env]
+                  v5_simple_shelves_10x14_1agent_0human_32shelves_2pickup_4_dropoff,
+                  v6_simple_human_10x10_1agent_5human_0shelves_2pickup_4_dropoff,
+                  v7_simple_human_and_shelves_10x14_1agent_5human_32shelves_2pickup_4_dropoff,
+                  v8_warehouse_env]
     curriculum_path = ["v1_simplest_env_10x10_1agent_0human_0shelves_1pickup_1dropoff", 
                        "v2_simple_env_20x20_1agent_0human_0shelves_1pickup_1dropoff", 
                        "v3_simple_env_multiple_agents_10x10_2agent_0human_0shelves_1pickup_1dropoff", 
                        "v4_simple_env_multiple_drop_pickup_10x10_2agent_0human_0shelves_4_pickup_8dropoff", 
-                       "v5_simple_shelves_10x14_1agent_0human_32shelves_2pickup_4_dropoff", 
-                       "v6_warehouse_env"]
+                       "v5_simple_shelves_10x14_1agent_0human_32shelves_2pickup_4_dropoff",
+                       "v6_simple_human_10x10_1agent_5human_0shelves_2pickup_4_dropoff",
+                       "v7_simple_human_and_shelves_10x14_1agent_5human_32shelves_2pickup_4_dropoff",
+                       "v8_warehouse_env"]
     for env_instance in curriculum:
         current_v = curriculum_path[curriculum.index(env_instance)]
         previous_v = curriculum_path[curriculum.index(env_instance) - 1] if curriculum.index(env_instance) > 0 else curriculum_path[curriculum.index(env_instance)]
-        train_DQN(env_instance, n_episodes=2, max_steps=1000, save_every=100, model_path=get_path(current_v), load_path=get_path(previous_v))
+        train_DQN(env_instance, n_episodes=1000, max_steps=1000, save_every=100, model_path=get_path(current_v), load_path=get_path(previous_v))
             
         
 
