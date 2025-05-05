@@ -55,19 +55,25 @@ pip install -r requirements.txt
 ### Running the A* Algorithm
 To run the A* algorithm, run the following command:
 ```bash
-
+python src/main.py run_a_star
 ```
 
 ### Training the Reinforcement Learning Model
 To train the reinforcement learning model, run the following command:
 ```bash
-
+python src/main.py dqn_train
 ```
 
-### Running the Reinforcement Learning Model
+### Evaluating the Reinforcement Learning Model
 To run the reinforcement learning model, run the following command:
 ```bash
+python src/main.py dqn_run
+```
 
+### Display logs (tensorboard)
+To display the logs of the training process, run the following command:
+```bash
+tensorboard --logdir=./runs/
 ```
 
 ### Running tests

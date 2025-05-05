@@ -10,6 +10,7 @@ torch==2.6.0
 
 # Visualization dependencies
 matplotlib==3.10.1
+tensorboard==2.19.0
 
 # Testing dependencies
 pytest==8.3.5

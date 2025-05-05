@@ -702,6 +702,9 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
     # Initialize the A* agent
     a_star_agent = AStarAgent(env)
 
+    # Set debug level
+    a_star_agent.debug_level = debug_level
+
     # Reset the environment
     observations, _ = env.reset()
 
@@ -771,10 +774,10 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
 
     # Print total delievered tasks
     total_delivered = sum(env.completed_tasks.values())
-    a_star_agent.debug(DEBUG_SPECIFIC, f"\nTotal delivered tasks: {total_delivered}")
+    a_star_agent.debug(DEBUG_INFO, f"\nTotal delivered tasks: {total_delivered}")
     # Print total scores
     total_score = sum(cumulative_rewards.values())
-    a_star_agent.debug(DEBUG_SPECIFIC, f"Total scores: {total_score}")
+    a_star_agent.debug(DEBUG_INFO, f"Total scores: {total_score}")
             
     # Close the environment
     env.close()

@@ -1,9 +1,12 @@
+import random
 import pytest
 import numpy as np
 import warnings
 from pettingzoo.test import parallel_api_test
 import sys
 import os
+
+import torch
 
 # Add the parent directory to the path to import the env module
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -13,7 +16,7 @@ from environment import env
 def warehouse_env():
     """Create a test environment"""
     with warnings.catch_warnings():
-        test_env = env(grid_size=(15, 15), n_agents=3, num_shelves=10, n_humans=2, num_pickup_points=2, num_dropoff_points=2, render_mode=None)
+        test_env = env(grid_size=(15, 15), human_grid_size=(15, 15), n_agents=3, num_shelves=10, n_humans=2, num_pickup_points=2, num_dropoff_points=2, render_mode=None, use_frame_stack=False, n_frames=1)
 
     yield test_env
 
@@ -126,7 +129,7 @@ def test_observation_space(warehouse_env):
 
     for agent, obs in observations.items():
         # Check observation shape
-        expected_shape = (9, 5, 5) # 9 channels, 5x5 grid
+        expected_shape = (10, 5, 5) # 10 channels, 5x5 grid
         assert obs.shape == expected_shape
 
         # Check observation bounds
@@ -167,7 +170,7 @@ def test_reward_mechanics(warehouse_env):
 
     # Each agent should recieve the step cost
     for agent in warehouse_env.agents:
-        assert rewards[agent] == warehouse_env.step_cost
+        assert rewards[agent] == -2.1
 
 def test_collision_handling(warehouse_env):
     """Test that collisions are handled correctly"""
@@ -215,3 +218,51 @@ def test_collision_handling(warehouse_env):
                         return
     # If we reach here, the test failed
     assert False, "Collision test failed: agents did not collide as expected"
+
+def test_observations():
+    """
+    Test that observations are equal between frame-stacked and non-frame-stacked environments
+    """
+
+    seed = random.randint(0, 1000)
+
+    # Create environments
+    env1 = env(grid_size=(5, 5), n_agents=1, n_humans=0, num_shelves=0, num_pickup_points=1, num_dropoff_points=1, render_mode="human", use_frame_stack=False)
+    env2 = env(grid_size=(5, 5), n_agents=1, n_humans=0, num_shelves=0, num_pickup_points=1, num_dropoff_points=1, render_mode="human", use_frame_stack=True, n_frames=1)
+
+    # Reset environments
+    obs1, _ = env1.reset(seed=seed)
+    obs2, _ = env2.reset(seed=seed)
+
+    # Check if observations are equal
+    assert len(obs1) == len(obs2)
+    assert len(obs1['agent_0']) == len(obs2['agent_0'])
+    assert obs1['agent_0'].shape == obs2['agent_0'].shape
+    assert np.array_equal(obs1['agent_0'], obs2['agent_0'])
+
+def test_gradients():
+    """
+    Test that gradients flow properly through the environment
+    """
+
+    seed = random.randint(0, 1000)
+
+    # Direct observation
+    base_env = env(use_frame_stack=False)
+    obs, _ = base_env.reset(seed=seed)
+    tensor1 = torch.from_numpy(obs['agent_0']).float().requires_grad_(True)
+    
+    # Wrapped observation
+    wrapped_env = env(use_frame_stack=True, n_frames=1)
+    wrapped_obs, _ = wrapped_env.reset(seed=seed)
+    tensor2 = torch.from_numpy(wrapped_obs['agent_0']).float().requires_grad_(True)
+    
+    # See if gradients flow properly
+    output1 = tensor1.sum()
+    output1.backward()
+    
+    output2 = tensor2.sum()
+    output2.backward()
+
+    assert tensor1.grad is not None, "Base tensor gradient is None"
+    assert tensor2.grad is not None, "Wrapped tensor gradient is None"

@@ -1,3 +1,4 @@
+from collections import deque
 from pettingzoo.utils import wrappers
 from pettingzoo.utils import ParallelEnv
 import numpy as np
@@ -11,28 +12,37 @@ import os
 import sys
 from .utils import SimpleHumanPlanner, get_random_empty_position, assign_new_human_goal
 from matplotlib.widgets import Button
+from supersuit import frame_stack_v1
 
 class WarehouseEnv(ParallelEnv):
     metadata = {'render_modes': ['human', 'rgb_array'], 'name': 'warehouse_v0'}
 
     def __init__(self, grid_size=(20, 20), human_grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, 
-                 num_pickup_points=3, num_dropoff_points=2, collision_penalty=-2, task_reward=50, step_cost=-0.1,
-                 observation_size=(5, 5), render_mode=None):
+                 num_pickup_points=3, num_dropoff_points=2, seed=None,
+                 observation_size=(5, 5), render_mode=None, use_frame_stack=True, n_frames=4):
         super().__init__()
 
         # Environment parameters
         self.grid_size = grid_size
         self.human_grid_size = human_grid_size
         self.observation_size = observation_size
+        self.observation_channels = 14
         self.n_agents = n_agents
         self.n_humans = n_humans
         self.num_shelves = num_shelves
         self.num_pickup_points = num_pickup_points
         self.num_dropoff_points = num_dropoff_points
-        self.collision_penalty = collision_penalty
-        self.task_reward = task_reward
-        self.step_cost = step_cost
+        self.collision_penalty = -0.15
+        self.task_reward = 1
+        self.step_cost = -0.1
+        self.progress_reward = 0.05
+        self.wait_penalty = -0.15
+        self.revisit_penalty = -0.02
+        self.gamma = 0.99
         self.render_mode = render_mode
+        self.use_frame_stack = use_frame_stack
+        self.n_frames = n_frames
+        self.seed = seed
 
         # Create list of possible agents
         self.possible_agents = ["agent_" + str(i) for i in range(self.n_agents)]
@@ -48,6 +58,8 @@ class WarehouseEnv(ParallelEnv):
 
         # Initialize grid and agent data
         self.reset()
+
+        self.path_cache = {}  # Cache for full paths, not just distances
 
     @functools.lru_cache(maxsize=None)
     def action_space(self, agent):
@@ -86,6 +98,10 @@ class WarehouseEnv(ParallelEnv):
         return spaces.Box(low=0, high=1, shape=obs_shape, dtype=np.float32)
 
     def reset(self, seed=None, options=None):
+
+        if self.seed is not None:
+            seed = self.seed
+
         if seed is not None:
             np.random.seed(seed)
             random.seed(seed)
@@ -274,19 +290,19 @@ class WarehouseEnv(ParallelEnv):
                         new_pos = (new_row, new_col)
                         self.total_distance[agent] += 1
                 else:
-                    # NEW: Add penalty for attempting to move into a wall or obstacle
+                    # Add penalty for attempting to move into a wall or obstacle
                     if (new_row < 0 or new_row >= self.grid_size[0] or 
                         new_col < 0 or new_col >= self.grid_size[1]):
                         # Boundary collision
-                        rewards[agent] -= 3.0
+                        rewards[agent] += self.collision_penalty
                         self.collisions[agent] += 1
                     elif self.grid[new_row, new_col] == 2:
                         # Shelf collision
-                        rewards[agent] -= 2.0
+                        rewards[agent] += self.collision_penalty
                         self.collisions[agent] += 1
                     elif self.grid[new_row, new_col] == 3:
                         # Human collision
-                        rewards[agent] -= 2.5
+                        rewards[agent] += self.collision_penalty
                         self.collisions[agent] += 1
             
             # Store intended position
@@ -656,7 +672,7 @@ class WarehouseEnv(ParallelEnv):
         goal_pos = self.agent_goals[agent]
 
         # Initialize observation channels
-        obs = np.zeros((10,) + self.local_observation_size, dtype=np.float32)
+        obs = np.zeros((self.observation_channels,) + self.local_observation_size, dtype=np.float32)
 
         # Extract the local observation window (5x5 grid around the agent)
         r, c = agent_pos
@@ -739,6 +755,18 @@ class WarehouseEnv(ParallelEnv):
         obs[9, :, :] = 0  # Reset channel
         obs[9, 0, :] = norm_dr  # First row encodes vertical direction
         obs[9, :, 0] = norm_dc  # First column encodes horizontal direction
+
+        # Channel 11: Agent's global row coordinate (normalized to [0, 1])
+        #obs[10, :, :] = agent_pos[0] / (self.grid_size[0] - 1)
+
+        # Channel 12: Agent's global column coordinate (normalized to [0, 1])
+        #obs[11, :, :] = agent_pos[1] / (self.grid_size[1] - 1)
+
+        # Channel 13: Goal's global row coordinate (normalized to [0, 1])
+        #obs[12, :, :] = goal_pos[0] / (self.grid_size[0] - 1)
+
+        # Channel 14: Goal's global column coordinate (normalized to [0, 1])
+        #obs[13, :, :] = goal_pos[1] / (self.grid_size[1] - 1)
 
         return obs
     
@@ -940,6 +968,19 @@ class WarehouseEnv(ParallelEnv):
         """
         Assign a new goal to the agent
         """
+
+        # Reset min distance to goal
+        if hasattr(self, 'min_dist_to_goal'):
+            self.min_dist_to_goal[agent] = float('inf')
+
+        # Reset position history
+        if hasattr(self, 'position_history'):
+            self.position_history[agent] = []
+
+        # Set new start position for the task
+        if hasattr(self, 'task_start_pos'):
+            self.task_start_pos[agent] = self.agent_positions[agent]
+
         
         if self.agent_carrying[agent]:
             # If agent is carrying an item, deliver it to appropriate dropoff point
@@ -951,45 +992,41 @@ class WarehouseEnv(ParallelEnv):
             self.agent_goals[agent] = self.pickup_points[pickup_idx]
             
     def _fourth_pass(self, agent, action, current_pos, rewards):
-        """Process rewards for agent actions"""
+        """Process rewards and penalties for the agent's action"""
         goal = self.agent_goals[agent]
         prev_pos = self.previous_positions[agent]
         
-        # Track positions for oscillation detection
+        # Track task start position and position history
+        if not hasattr(self, 'task_start_pos'):
+            self.task_start_pos = {agent: None for agent in self.agents}
+        
+        if prev_pos is None or (hasattr(self, 'last_goals') and self.last_goals.get(agent) != goal):
+            self.task_start_pos[agent] = current_pos
+        
         if not hasattr(self, 'position_history'):
             self.position_history = {agent: [] for agent in self.agents}
         self.position_history[agent] = self.position_history[agent][-6:] + [current_pos]
+
+        if not hasattr(self, 'min_dist_to_goal'):
+            self.min_dist_to_goal = {agent: float('inf') for agent in self.agents}
         
-        # SIMPLIFIED REWARD STRUCTURE
+        # 1 Step penalty (efficiency)
+        rewards[agent] += self.step_cost
+
+        # 2. Progress reward (potential-based shaping)
+        prev_potential = self._potential(prev_pos, goal) if prev_pos is not None else 0
+        curr_potential = self._potential(current_pos, goal)
+        rewards[agent] += self.gamma * curr_potential - prev_potential
+
+        # 3. Revisit penalty
+        if current_pos in self.position_history[agent]:
+            rewards[agent] += self.revisit_penalty
+
+        # 4. Wait penalty
+        if action == 6:
+            rewards[agent] += self.wait_penalty       
         
-        # 1. Basic movement rewards when making progress
-        if prev_pos is not None and prev_pos != current_pos:
-            try:
-                # Use path distance when available
-                prev_dist = self._calculate_path_distance(prev_pos, goal)
-                curr_dist = self._calculate_path_distance(current_pos, goal)
-                dist_delta = prev_dist - curr_dist
-                
-                # Simple scaling of progress
-                rewards[agent] += dist_delta * 2.0
-                
-            except Exception:
-                # Fallback to Manhattan distance
-                prev_dist = abs(prev_pos[0] - goal[0]) + abs(prev_pos[1] - goal[1])
-                curr_dist = abs(current_pos[0] - goal[0]) + abs(current_pos[1] - goal[1])
-                rewards[agent] += (prev_dist - curr_dist) * 1.5
-        
-        # 2. Simple oscillation detection (single mechanism)
-        if len(self.position_history[agent]) >= 6:
-            positions = self.position_history[agent]
-            if current_pos in positions[-5:-1]:  # If we revisit a recent position
-                rewards[agent] -= 4.0
-        
-        # 3. Wait penalty (simplified)
-        if action == 6:  # Wait action
-            rewards[agent] -= 2.0
-        
-        # 4. Task completion rewards (kept mostly intact)
+        # 5. Task rewards - (Sparse, strong)
         if action == 4:  # Pickup
             if current_pos in self.pickup_points and not self.agent_carrying[agent]:
                 if current_pos == self.agent_goals[agent]:
@@ -1002,12 +1039,11 @@ class WarehouseEnv(ParallelEnv):
                     self.agent_item_types[agent] = pickup_idx % len(self.dropoff_points)
                     dropoff_idx = self.agent_item_types[agent]
                     self.agent_goals[agent] = self.dropoff_points[dropoff_idx]
-                else:
-                    # Wrong pickup point
-                    rewards[agent] -= 5
-            else:
-                # Invalid pickup
-                rewards[agent] -= 5
+                    
+                    # Record this new goal for task_start tracking
+                    if not hasattr(self, 'last_goals'):
+                        self.last_goals = {}
+                    self.last_goals[agent] = self.agent_goals[agent]
         
         elif action == 5:  # Dropoff
             if current_pos in self.dropoff_points and self.agent_carrying[agent]:
@@ -1016,14 +1052,21 @@ class WarehouseEnv(ParallelEnv):
                     self.agent_carrying[agent] = False
                     rewards[agent] += self.task_reward
                     self.completed_tasks[agent] += 1
+                    
+                    # Record last goal before assigning new one
+                    if not hasattr(self, 'last_goals'):
+                        self.last_goals = {}
+                    self.last_goals[agent] = self.agent_goals[agent]
+                    
+                    # Assign new goal
                     self._assign_new_goal(agent)
-                else:
-                    # Wrong dropoff point
-                    rewards[agent] -= 5
-            else:
-                # Invalid dropoff
-                rewards[agent] -= 5
 
+    def _potential(self, pos, goal):
+        # Normalize the potential to a range of [0, 1]
+        max_dist = self.grid_size[0] + self.grid_size[1]
+        return -self._calculate_path_distance(pos, goal) / max_dist 
+
+    #@functools.lru_cache(maxsize=1024)
     def _calculate_path_distance(self, current_pos, goal_pos):
         """Calculate a more meaningful distance considering obstacles"""
         
@@ -1056,6 +1099,43 @@ class WarehouseEnv(ParallelEnv):
         
         # If no path found, use Manhattan distance as fallback
         return abs(current_pos[0] - goal_pos[0]) + abs(current_pos[1] - goal_pos[1])
+
+    def _calculate_path_and_distance(self, current_pos, goal_pos):
+        """Calculate shortest path and distance considering obstacles"""
+        
+        if (current_pos, goal_pos) in self.path_cache:
+            return self.path_cache[(current_pos, goal_pos)]
+            
+        # BFS implementation
+        queue = deque([(current_pos, [current_pos])])  # (position, path_so_far)
+        visited = set([current_pos])
+        
+        while queue:
+            pos, path = queue.popleft()
+            
+            if pos == goal_pos:
+                self.path_cache[(current_pos, goal_pos)] = (path, len(path)-1)
+                return path, len(path)-1
+            
+            # Check all four directions
+            for dr, dc in [(0, -1), (1, 0), (0, 1), (-1, 0)]:
+                new_r, new_c = pos[0] + dr, pos[1] + dc
+                new_pos = (new_r, new_c)
+                
+                # Check if position is valid and not a shelf
+                if (0 <= new_r < self.grid_size[0] and 
+                    0 <= new_c < self.grid_size[1] and
+                    self.grid[new_r, new_c] != 2 and  # Not a shelf
+                    new_pos not in visited):
+                    
+                    # Create a new path by appending this position
+                    new_path = path + [new_pos]
+                    visited.add(new_pos)
+                    queue.append((new_pos, new_path))
+    
+        # If no path found, use Manhattan distance as fallback
+        self.path_cache[(current_pos, goal_pos)] = (None, abs(current_pos[0] - goal_pos[0]) + abs(current_pos[1] - goal_pos[1]))
+        return None, abs(current_pos[0] - goal_pos[0]) + abs(current_pos[1] - goal_pos[1])
 
 def second_pass(entities_order, current_positions, new_positions, actions, all_entities, reserved_positions, allow_overlap=False):
     final_positions = {}
@@ -1122,10 +1202,76 @@ def second_pass(entities_order, current_positions, new_positions, actions, all_e
     
     return final_positions, collision_entities, reserved_positions
 
+class WarehouseFrameStack:
+    """
+    Frame stack wrapper for the Warehouse environment
+    """
+
+    def __init__(self, env):
+        self.env = env
+        
+        # Pass through environment attributes
+        self.use_frame_stack = env.use_frame_stack
+        self.n_frames = env.n_frames
+
+        self.frames = {}
+
+    def reset(self, seed=None):
+        """
+        Reset the environment and return the initial observation
+        """
+        obs, info = self.env.reset(seed=seed)
+        
+        # Initialize frame stack
+        self.frames = {
+            agent: deque(
+                [obs[agent].copy() for _ in range(self.n_frames)], 
+                maxlen=self.n_frames) 
+        for agent in self.agents}
+
+        # Create stacked observations
+        stacked_obs = {}
+        for agent in self.env.agents:
+            stacked_obs[agent] = np.concatenate(list(self.frames[agent]), axis=0)
+
+        return stacked_obs, info
+    
+    def step(self, actions):
+        """
+        Take a step in the environment with the given actions
+        """
+        obs, rewards, terminated, truncated, info = self.env.step(actions)
+        
+        # Update frame stack
+        for agent in self.env.agents:
+            self.frames[agent].append(obs[agent])
+
+        # Create stacked observations
+        stacked_obs = {}
+        for agent in self.env.agents:
+            stacked_obs[agent] = np.concatenate(list(self.frames[agent]), axis=0)
+
+        return stacked_obs, rewards, terminated, truncated, info
+    
+    def __getattr__(self, name):
+        """
+        Delegate attribute access to underlying environment
+        """
+        try:
+            return getattr(self.env, name)
+        except AttributeError:
+            raise AttributeError(f"'{type(self).__name__}' object has no attribute '{name}'")
+
 # Wrapper for the environment
 def env(grid_size=(20, 20), human_grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, 
-        num_pickup_points=3, num_dropoff_points=2, render_mode=None):
-    env = WarehouseEnv(grid_size=grid_size, n_agents=n_agents, n_humans=n_humans, human_grid_size=human_grid_size, num_shelves=num_shelves, 
-                        num_pickup_points=num_pickup_points, num_dropoff_points=num_dropoff_points, render_mode=render_mode)
-    # env = wrappers.CaptureStdoutWrapper(env)
-    return env
+        num_pickup_points=3, num_dropoff_points=2, render_mode=None, n_frames=8, use_frame_stack=True, seed=None):
+
+    base_env = WarehouseEnv(grid_size=grid_size, n_agents=n_agents, n_humans=n_humans, human_grid_size=human_grid_size, num_shelves=num_shelves,   num_pickup_points=num_pickup_points, num_dropoff_points=num_dropoff_points, render_mode=render_mode, n_frames=n_frames, use_frame_stack=use_frame_stack,
+                            seed=seed)
+
+    if use_frame_stack:
+        return WarehouseFrameStack(base_env)
+    else:
+        # Use the base environment without frame stacking
+        return base_env
+

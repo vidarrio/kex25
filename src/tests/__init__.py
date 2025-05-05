@@ -8,7 +8,7 @@ This module contains unit tests for various components:
 """
 
 # Import test modules
-from . import test_env
+from . import test_env, test_rl
 
 # Export key test functions if needed
 from .test_env import (
@@ -23,6 +23,10 @@ from .test_env import (
     test_collision_handling
 )
 
+from .test_rl import (
+    test_compare_single_frame_and_base_envs,
+)
+
 # Define what gets imported with "from tests import *"
 __all__ = [
     "test_api_compliance",
@@ -34,4 +38,5 @@ __all__ = [
     "test_agent_goals",
     "test_reward_mechanics",
     "test_collision_handling"
+    "test_compare_single_frame_and_base_envs"
 ]
