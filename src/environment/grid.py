@@ -11,12 +11,14 @@ import os
 import sys
 from .utils import SimpleHumanPlanner, get_random_empty_position, assign_new_human_goal
 from matplotlib.widgets import Button
+# Oscillation detection
+from collections import deque
 
 class WarehouseEnv(ParallelEnv):
     metadata = {'render_modes': ['human', 'rgb_array'], 'name': 'warehouse_v0'}
 
     def __init__(self, grid_size=(20, 20), human_grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, 
-                 num_pickup_points=3, num_dropoff_points=2, collision_penalty=-50, task_reward=100, step_cost=-50,
+                 num_pickup_points=3, num_dropoff_points=2, collision_penalty=-5, task_reward=50, step_cost=-2,
                  observation_size=(5, 5), render_mode=None):
         super().__init__()
 
@@ -34,9 +36,20 @@ class WarehouseEnv(ParallelEnv):
         self.step_cost = step_cost
         self.render_mode = render_mode
         
-        self.wrong_pickup_penalty = -50
-        self.step_closer_reward = 50
-        self.wrong_dropoff_penalty = -50
+        self.wrong_pickup_penalty = -15
+        self.step_closer_reward = 1
+        self.shaping_gamma = 0.99  # discount factor for potential-based shaping
+        self.wrong_dropoff_penalty = -15
+
+        # Oscillation detection: track recent positions per agent
+        self.oscillation_penalty = -5  # heavy penalty when bouncing between two cells
+        self.oscillation_window = 2     # history length to detect A->B->A->B->A->B
+        self.position_history = {agent: deque(maxlen=self.oscillation_window) for agent in []}  # will init in reset
+        # Discourage invalid actions when standing still
+        self.invalid_action_penalty = -20
+
+        self.pickup_points = []
+
 
         # Create list of possible agents
         self.possible_agents = ["agent_" + str(i) for i in range(self.n_agents)]
@@ -108,16 +121,6 @@ class WarehouseEnv(ParallelEnv):
         # Place shelves in a warehouse-like layout (aisles)
         self._place_shelves()
 
-        # Place pickup points (e.g. packing stations)
-        self.pickup_points = self._place_random_points(self.num_pickup_points, [1, 2])
-        for pos in self.pickup_points:
-            self.grid[pos] = 4
-            
-            
-        # Place dropoff points (e.g. shipping area)
-        # self.dropoff_points = self._place_random_points(self.num_dropoff_points, [1, 2, 4])
-        # for pos in self.dropoff_points:
-        #     self.grid[pos] = 5
         # Place dropoff points (e.g. shipping area)
         self._place_dropoff_points()
 
@@ -127,16 +130,22 @@ class WarehouseEnv(ParallelEnv):
         self.agent_goals = {}
         self.agent_item_types = {agent: None for agent in self.agents}
 
+        # Initialize agent positions
         for agent in self.agents:
-            # Find empty position
             pos = get_random_empty_position(grid=self.grid, grid_size=self.grid_size)
             self.agent_positions[agent] = pos
             self.grid[pos] = 1
 
-            # Assign initial goal (pickup point)
-            self._assign_new_goal(agent)
+        # Place exactly one pickup point per agent
+        self.pickup_points = self._place_random_points(self.n_agents, avoid_values=[1, 2, 3, 4, 5])
+        for pos in self.pickup_points:
+            self.grid[pos] = 4
+
+        # Assign each agent a unique pickup point
+        for agent, pos in zip(self.agents, self.pickup_points):
+            self.agent_goals[agent] = pos
             
-         # Initialize humans at random positions
+        # Initialize humans at random positions
         self.human_positions = {}
         self.human_goals = {}
 
@@ -154,6 +163,10 @@ class WarehouseEnv(ParallelEnv):
         self.completed_tasks = {agent: 0 for agent in self.agents}
         self.collisions = {agent: 0 for agent in self.agents}
         self.total_distance = {agent: 0 for agent in self.agents}
+
+        # Initialize position history for active agents
+        from collections import deque
+        self.position_history = {agent: deque(maxlen=self.oscillation_window) for agent in self.agents}
 
         # Create observations
         observations = {agent: self._get_observation(agent) for agent in self.agents}
@@ -321,6 +334,20 @@ class WarehouseEnv(ParallelEnv):
             action = actions[agent]
             current_pos = self.agent_positions[agent]
             self._fourth_pass(agent, action, current_pos, rewards)
+
+        # Oscillation penalty: exponential based on sustained A<->B oscillations
+        for agent in self.agents:
+            # Update position history
+            self.position_history[agent].append(self.agent_positions[agent])
+            hist = self.position_history[agent]
+            # Detect basic 2-step oscillation pattern
+            if len(hist) >= 4 and hist[-1] == hist[-3] and hist[-2] == hist[-4]:
+                # Determine number of full oscillation pairs: for hist lengths 4,6...
+                num_pairs = len(hist) // 2 - 1  # hist 4->1, 6->2, etc.
+                # Exponential penalty multiplier
+                multiplier = 2 ** num_pairs
+                penalty = self.oscillation_penalty * multiplier
+                rewards[agent] += penalty
 
         # Check for termination criteria (e.g. max steps etc.)
         # In a warehouse setting, we might not have a natural termination point
@@ -636,6 +663,62 @@ class WarehouseEnv(ParallelEnv):
             line.set_visible(self.show_goal_lines)
         
         self.fig.canvas.draw_idle()  # Redraw the figure to show changes
+
+    def _fourth_pass(self, agent, action, current_pos, rewards):
+        """
+        Handles pickup/dropoff/wait actions for the agent, applies appropriate rewards/penalties.
+        """
+        # Distance to goal
+        goal = self.agent_goals[agent]
+        prev_pos = self.previous_positions[agent]
+        # 4: Pickup Item
+        if action == 4:
+            if not self.agent_carrying[agent]:
+                if current_pos in self.pickup_points:
+                    # Correct pickup
+                    self.agent_carrying[agent] = True
+                    # Assign dropoff point (random for now)
+                    dropoff_idx = random.randrange(len(self.dropoff_points))
+                    self.agent_item_types[agent] = dropoff_idx
+                    self.agent_goals[agent] = self.dropoff_points[dropoff_idx]
+                    # Task reward will be given on dropoff
+                else:
+                    # Wrong pickup point, heavy penalty
+                    rewards[agent] += self.invalid_action_penalty
+            else:
+                # Already carrying, can't pick up
+                rewards[agent] += self.invalid_action_penalty
+        # 5: Drop Item
+        elif action == 5:
+            if self.agent_carrying[agent]:
+                dropoff_idx = self.agent_item_types[agent]
+                if current_pos == self.dropoff_points[dropoff_idx]:
+                    # Correct dropoff
+                    self.agent_carrying[agent] = False
+                    self.completed_tasks[agent] += 1
+                    # Assign new pickup point (random for now)
+                    pickup_idx = random.randrange(len(self.pickup_points))
+                    self.agent_item_types[agent] = None
+                    self.agent_goals[agent] = self.pickup_points[pickup_idx]
+                    rewards[agent] += self.task_reward
+                else:
+                    # Wrong dropoff point, heavy penalty
+                    rewards[agent] += self.invalid_action_penalty
+            else:
+                # Not carrying, can't drop
+                rewards[agent] += self.invalid_action_penalty
+        # Handle wait action (6)
+        elif action == 6:
+            # No action taken, just wait
+            # Add a small penalty for waiting
+            factor = 1
+            if prev_pos == current_pos:
+                factor = 4
+            rewards[agent] += 2 * self.step_cost * factor
+            pass
+        # Movement actions (0-3): no special handling here
+        else:
+            pass
 
     def _get_observation(self, agent):
         """
@@ -989,23 +1072,30 @@ class WarehouseEnv(ParallelEnv):
             
             self.agent_goals[agent] = self.dropoff_points[dropoff_idx]
         else:
+            # Avoid spawning pickups on agents (1), shelves (2), dynamic obstacles (3), or dropoffs (5)
+            pos = get_random_empty_position(grid=self.grid, grid_size=self.grid_size, avoid_values=[1, 2, 3, 4, 5])
+            self.pickup_points.append(pos)
+            self.grid[pos] = 4  # Mark as pickup point
+            self.agent_goals[agent] = pos
+            
             # If agent is not carrying an item, go to a random pickup point
-            pickup_idx = random.randint(0, len(self.pickup_points) - 1)
-            self.agent_goals[agent] = self.pickup_points[pickup_idx]
+            # pickup_idx = random.randint(0, len(self.pickup_points) - 1)
+            # self.agent_goals[agent] = self.pickup_points[pickup_idx]
             
     def _fourth_pass(self, agent, action, current_pos, rewards):
-
         # Distance to goal
         goal = self.agent_goals[agent]
         prev_pos = self.previous_positions[agent]
 
-        # Reward for moving closer to goal
-        if prev_pos != None:
+        # Potential-based reward shaping
+        if prev_pos is not None:
             prev_dist = abs(prev_pos[0] - goal[0]) + abs(prev_pos[1] - goal[1])
             curr_dist = abs(current_pos[0] - goal[0]) + abs(current_pos[1] - goal[1])
-            if curr_dist < prev_dist:
-                rewards[agent] += self.step_closer_reward
-            
+            # Potential-based shaping: Phi(s) = -distance_to_goal(s)
+            # shaping reward = gamma * Phi(s') - Phi(s) = prev_dist - shaping_gamma * curr_dist
+            shaping_reward = prev_dist - self.shaping_gamma * curr_dist
+            rewards[agent] += shaping_reward
+            # The old step_closer_reward is replaced by shaping_reward
 
         # Handle pickup action (4)
         if action == 4:
@@ -1020,6 +1110,9 @@ class WarehouseEnv(ParallelEnv):
                     # Remember which item type was picked up
                     pickup_idx = self.pickup_points.index(current_pos)
                     self.agent_item_types[agent] = pickup_idx % len(self.dropoff_points)
+
+                    self.pickup_points.remove(current_pos)  # Remove pickup point from grid
+                    self.grid[current_pos] = 0  # Clear the pickup point from the grid
 
                     # Assign new goal (dropoff point)
                     self._assign_new_goal(agent)
