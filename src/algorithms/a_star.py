@@ -1,6 +1,7 @@
 import heapq
 import numpy as np
 import time
+import random
 
 DEBUG_NONE = 0
 DEBUG_CRITICAL = 1
@@ -332,7 +333,8 @@ class AStarAgent:
                             # This wait path is better
                             came_from[wait_node] = (current, 6)  # Wait action
                             g_score[wait_node] = tentative_g_score
-                            f_score[wait_node] = tentative_g_score + self._heuristic((current_r, current_c), goal)
+                            # Add tiny noise to break symmetry
+                            f_score[wait_node] = tentative_g_score + self._heuristic((current_r, current_c), goal) + random.random() * 1e-3
 
                             heapq.heappush(open_set, (f_score[wait_node], counter, wait_node))
                             counter += 1
@@ -363,7 +365,8 @@ class AStarAgent:
                     # Record this path
                     came_from[next_node] = (current, action)
                     g_score[next_node] = tentative_g_score
-                    f_score[next_node] = tentative_g_score + self._heuristic((next_r, next_c), goal)
+                    # Add tiny noise to break symmetry
+                    f_score[next_node] = tentative_g_score + self._heuristic((next_r, next_c), goal) + random.random() * 1e-3
 
                     heapq.heappush(open_set, (f_score[next_node], counter, next_node))
                     counter += 1
@@ -380,7 +383,8 @@ class AStarAgent:
                     # This wait path is better
                     came_from[wait_node] = (current, 6)  # Wait action
                     g_score[wait_node] = tentative_g_score
-                    f_score[wait_node] = tentative_g_score + self._heuristic((current_r, current_c), goal)
+                    # Add tiny noise to break symmetry
+                    f_score[wait_node] = tentative_g_score + self._heuristic((current_r, current_c), goal) + random.random() * 1e-3
                     
                     heapq.heappush(open_set, (f_score[wait_node], counter, wait_node))
                     counter += 1
@@ -750,7 +754,7 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
                     a_star_agent.debug(DEBUG_CRITICAL, f"{agent} has reached its goal!")
         
         # Render the environment
-        # env.render()
+        env.render()
         
         # Print info
         a_star_agent.debug(DEBUG_INFO, f"Rewards: {rewards}")
@@ -768,7 +772,9 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
         # Break if all agents are done
         if terminations["__all__"]:
             break
-
+    
+    
+    
     # Print total delievered tasks
     total_delivered = sum(env.completed_tasks.values())
     a_star_agent.debug(DEBUG_SPECIFIC, f"\nTotal delivered tasks: {total_delivered}")
@@ -778,3 +784,4 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
             
     # Close the environment
     env.close()
+    return total_delivered
