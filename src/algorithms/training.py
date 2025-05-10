@@ -190,8 +190,8 @@ def run_evaluation(agent, phase, episode, debug_level, max_steps, eval_episodes,
         
     return True, current_performance, eval_history, improved
 
-def run_episode(env, agent, max_steps, episode, sampling_mode):
-    """Run a single training episode."""
+def run_episode(agent, max_steps, episode, sampling_mode):
+    """Run a single training episode, using QMIX if the agent supports it."""
     # Initialize timing and metrics
     t_start = time.time()
     env_time = 0
@@ -200,12 +200,16 @@ def run_episode(env, agent, max_steps, episode, sampling_mode):
     
     # Reset environment
     t_reset = time.time()
-    observations, _ = env.reset()
+    observations, _ = agent.env.reset()
     env_time += time.time() - t_reset
+    
+    # Get initial global state if agent uses QMIX
+    if hasattr(agent, 'use_qmix') and agent.use_qmix:
+        global_state, _ = agent.env.get_global_state()
     
     # Track episode data
     score = 0
-    episode_actions = {agent_id: [] for agent_id in env.agents}
+    episode_actions = {agent_id: [] for agent_id in agent.env.agents}
     
     # Determine sampling mode
     current_sampling_mode = sampling_mode
@@ -225,12 +229,24 @@ def run_episode(env, agent, max_steps, episode, sampling_mode):
             
         # Take environment step
         t_env = time.time()
-        next_observations, rewards, terminations, truncations, infos = env.step(actions)
+        next_observations, rewards, terminations, truncations, infos = agent.env.step(actions)
         env_time += time.time() - t_env
         
         # Agent learning
         t_learn = time.time()
-        agent.step(observations, actions, rewards, next_observations, terminations)
+        # Check if agent uses QMIX
+        if hasattr(agent, 'use_qmix') and agent.use_qmix:
+            # Get next global state
+            next_global_state, _ = agent.env.get_global_state()
+            # Use QMIX step with global state
+            agent.step_qmix(observations, actions, rewards, next_observations, terminations,
+                          global_state, next_global_state)
+            # Update global state for next step
+            global_state = next_global_state
+        else:
+            # Standard DQN step
+            agent.step(observations, actions, rewards, next_observations, terminations)
+            
         learn_time += time.time() - t_learn
         
         # Update state and score
@@ -243,7 +259,7 @@ def run_episode(env, agent, max_steps, episode, sampling_mode):
     
     # Get episode metrics
     episode_duration = time.time() - t_start
-    episode_deliveries = sum(env.completed_tasks.values())
+    episode_deliveries = sum(agent.env.completed_tasks.values())
     
     return score, episode_actions, episode_deliveries, {
         'env_time': env_time,
@@ -334,7 +350,7 @@ def check_early_stopping(agent, env, episode, metrics_history, no_improvement):
 
 def train_DQN(env, agent=None, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
              save_every=100, phase=1, sampling_mode='auto', use_early_stopping=False,
-             eval_every=200, eval_episodes=100):
+             eval_every=200, eval_episodes=100, use_qmix=False):
     """
     Train Q-learning agent with interactive control and periodic evaluation.
     
@@ -350,6 +366,7 @@ def train_DQN(env, agent=None, n_episodes=1000, max_steps=1000, debug_level=DEBU
         use_early_stopping: Whether to use early stopping based on performance
         eval_every: Episodes between evaluations
         eval_episodes: Number of episodes for each evaluation
+        use_qmix: Whether to use QMIX for training (default: False) - only used if creating a new agent
         
     Returns:
         agent: Trained QLAgent
@@ -369,7 +386,19 @@ def train_DQN(env, agent=None, n_episodes=1000, max_steps=1000, debug_level=DEBU
         print(f"Using {num_threads} CPU threads for data loading.")
     
     # Initialize agent and keyboard controls
-    ql_agent = initialize_agent(env, agent, debug_level, phase, sampling_mode)
+    if not agent:
+        ql_agent = QLAgent(
+            env, debug_level=debug_level, phase=phase, 
+            use_tensorboard=True, use_qmix=use_qmix
+        )
+    else:
+        ql_agent = agent
+        ql_agent.env = env
+        
+    # Log whether QMIX is being used
+    if hasattr(ql_agent, 'use_qmix') and ql_agent.use_qmix:
+        print("Using QMIX for centralized training with decentralized execution")
+    
     control = setup_keyboard_listener()
     print("\nTraining control: Press 'n' to move to next phase, 'e' to evaluate current model, 'q' to quit training")
     
@@ -521,7 +550,7 @@ def train_DQN(env, agent=None, n_episodes=1000, max_steps=1000, debug_level=DEBU
         
         # Run single episode
         score, episode_actions, episode_deliveries, episode_timing = run_episode(
-            env, ql_agent, max_steps, episode, sampling_mode
+            ql_agent, max_steps, episode, sampling_mode
         )
         
         # Check control flags AGAIN after episode - critical for responsiveness
@@ -641,17 +670,17 @@ def train_DQN(env, agent=None, n_episodes=1000, max_steps=1000, debug_level=DEBU
 def create_stage1_env():
     """Create Stage 1 basic navigation environment."""
     return env(grid_size=(5, 5), n_agents=1, n_humans=0, num_shelves=0, 
-              num_pickup_points=1, num_dropoff_points=1, render_mode="human")
+              num_pickup_points=1, num_dropoff_points=1, render_mode="human", env_name="stage1")
 
 def create_stage2_env():
     """Create Stage 2 environment with obstacles."""
     return env(grid_size=(10, 8), n_agents=1, n_humans=0, num_shelves=16, 
-              num_pickup_points=1, num_dropoff_points=1, render_mode="human")
+              num_pickup_points=1, num_dropoff_points=1, render_mode="human", env_name="stage2")
 
 def create_stage3_env():
     """Create Stage 3 multi-agent warehouse environment."""
     return env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=6, n_humans=10, 
-              num_shelves=2048, num_pickup_points=3, num_dropoff_points=2, render_mode="human")
+              num_shelves=2048, num_pickup_points=3, num_dropoff_points=2, render_mode="human", env_name="stage3")
 
 def initialize_multi_agent_networks(agent, new_env, source_agent_id="agent_0"):
     """Copy network architecture and weights from one agent to all others."""
@@ -689,23 +718,39 @@ def initialize_multi_agent_networks(agent, new_env, source_agent_id="agent_0"):
             
     return agent
 
-def train_stage(stage_num, stage_names, stage_env, agent, max_steps, save_every):
+def train_stage(stage_num, stage_names, stage_env, agent, max_steps, save_every, use_qmix=False):
     """Train a specific curriculum stage and handle its outcomes."""
     print(f"\n=== STAGE {stage_num}: {stage_names[stage_num]} ===")
     print("Press 'n' during training to advance to next phase, 'e' to evaluate current model, 'q' to quit training completely")
     
     # Configure agent parameters for this stage
     if agent is not None:
+        # Update the agent's phase to match the current stage
+        agent.phase = stage_num
         agent.epsilon = 0.9
         
-    # Train for this stage
+        # Update model name for this phase
+        agent.model_name = f"phase_{stage_num}_dqn_{time.strftime('%Y%m%d-%H%M%S')}.pth"
+        agent.model_path = os.path.join(get_model_path(), agent.model_name)
+        
+        # Update TensorBoard writer for the new phase
+        if agent.use_tensorboard and hasattr(agent, 'writer'):
+            agent.writer.close()
+            agent.writer = SummaryWriter(log_dir=f"runs/{agent.model_name}")
+            
+            # Log phase transition
+            agent.writer.add_text("Training", 
+                                f"Entered Stage {stage_num}: {stage_names[stage_num]} with QMIX={use_qmix}")
+    
+    # Train for this stage (use_qmix only used if agent is None)
     agent, exit_reason, eval_history = train_DQN(
         stage_env, 
         agent=agent, 
         n_episodes=200000,
         max_steps=max_steps, 
         save_every=save_every, 
-        phase=stage_num
+        phase=stage_num,  # Pass the current stage number
+        use_qmix=use_qmix
     )
     
     # Get model path for this stage
@@ -723,69 +768,12 @@ def train_stage(stage_num, stage_names, stage_env, agent, max_steps, save_every)
     else:
         benchmark_results = None
     
-    # If we're moving to the next phase, ask for confirmation
-    if exit_reason == "nextphase" and stage_num < 3:  # Only ask if there are more phases
-        # Completely reset the terminal and input handling
-        try:
-            # First reset the terminal
-            os.system('stty sane')
-            
-            # Wait for terminal to stabilize
-            time.sleep(0.2)
-            
-            # Use popen to get simple single-character input with echo enabled
-            import subprocess
-            
-            print(f"\nReady to proceed to Stage {stage_num + 1}: {stage_names[stage_num + 1]}?")
-            print("Press y (yes), n (no), or q (quit): ", end='', flush=True)
-            
-            # Read a single character using bash
-            process = subprocess.Popen(['bash', '-c', 'read -n 1 c; echo "$c"'], 
-                                      stdout=subprocess.PIPE, 
-                                      stderr=subprocess.PIPE)
-            
-            # Get the output with timeout
-            stdout, stderr = process.communicate(timeout=30)
-            
-            # Decode the byte output to string
-            response = stdout.decode('utf-8').strip() if stdout else ''
-            
-            # Echo what was pressed
-            print(response)
-            
-            # Process the response - CRITICAL FIX: Handle 'n' as "no" here
-            if response.lower() == 'y':
-                print(f"\nProceeding to Stage {stage_num + 1}...")
-                # KEEP exit_reason as "nextphase" to proceed
-            elif response.lower() == 'n':
-                print("\nStaying in current phase for more training...")
-                # CHANGE exit_reason to "continue" to stay in current phase
-                exit_reason = "continue"  # This is the key fix
-            elif response.lower() == 'q':
-                print("\nQuitting training as requested...")
-                exit_reason = "quit"
-            else:
-                print(f"\nUnrecognized input: '{response}'. Staying in current phase.")
-                exit_reason = "continue"
-                
-        except subprocess.TimeoutExpired:
-            print("\nInput timed out. Staying in current phase.")
-            exit_reason = "continue"
-            
-            # Cleanup the process if it's still running
-            try:
-                process.kill()
-            except:
-                pass
-                
-        except Exception as e:
-            print(f"\nError during stage transition confirmation: {e}")
-            print("Staying in current phase as a precaution.")
-            exit_reason = "continue"
-            
-        finally:
-            # Make sure terminal is reset
-            os.system('stty sane')
+    # Modified behavior: If exit_reason is "nextphase", proceed automatically without confirmation
+    if exit_reason == "nextphase" and stage_num < 3:
+        # Skip confirmation and just print info
+        print(f"\nMoving to next phase at episode {agent.t_step}")
+        print(f"\nProceeding to Stage {stage_num + 1}: {stage_names[stage_num + 1]}...")
+        # exit_reason already set to "nextphase", no need to change
     
     return agent, exit_reason, eval_history, benchmark_results, model_path
 
@@ -793,12 +781,13 @@ def train_DQN_curriculum(target_env, n_episodes=1000, max_steps=1000, debug_leve
                         save_every=100, model_path=get_model_path()):
     """
     Train Q-learning agent with curriculum learning across multiple stages.
+    Uses QMIX for all stages to leverage global state information even in single-agent settings.
     """
     # Setup 
     STAGE_NAMES = {
-        1: "Basic Navigation Training",
-        2: "Navigation with Obstacles",
-        3: "Multi-agent with Dynamic Obstacles"
+        1: "Basic Navigation Training (with QMIX)",
+        2: "Navigation with Obstacles (with QMIX)",
+        3: "Multi-agent with Dynamic Obstacles (with QMIX)"
     }
     
     STAGE_STEPS = {
@@ -836,34 +825,47 @@ def train_DQN_curriculum(target_env, n_episodes=1000, max_steps=1000, debug_leve
     
     while current_stage <= 3:
         if current_stage == 1:
-            # STAGE 1: Basic Navigation
+            # STAGE 1: Basic Navigation with QMIX
             stage_env = create_stage1_env()
+            
+            # If agent already exists, configure it for QMIX
+            if agent is not None:
+                configure_agent_for_qmix(agent, stage_env)
+                
             agent, exit_reason, eval_history, benchmark, stage_model_path = train_stage(
-                1, STAGE_NAMES, stage_env, agent, STAGE_STEPS[1], STAGE_SAVE_FREQ[1]
+                1, STAGE_NAMES, stage_env, agent, STAGE_STEPS[1], STAGE_SAVE_FREQ[1], use_qmix=True
             )
             
             results["stage1_eval_history"] = eval_history
             results["stage1_benchmark"] = benchmark
             
         elif current_stage == 2:
-            # STAGE 2: Navigation with obstacles
+            # STAGE 2: Navigation with obstacles with QMIX
             stage_env = create_stage2_env()
+            
+            # If transitioning between stages, ensure QMIX is properly configured
+            if agent is not None:
+                configure_agent_for_qmix(agent, stage_env)
+                
             agent, exit_reason, eval_history, benchmark, stage_model_path = train_stage(
-                2, STAGE_NAMES, stage_env, agent, STAGE_STEPS[2], STAGE_SAVE_FREQ[2]
+                2, STAGE_NAMES, stage_env, agent, STAGE_STEPS[2], STAGE_SAVE_FREQ[2], use_qmix=True
             )
             
             results["stage2_eval_history"] = eval_history
             results["stage2_benchmark"] = benchmark
             
         else:  # current_stage == 3
-            # STAGE 3: Multi-agent with dynamic obstacles
+            # STAGE 3: Multi-agent with dynamic obstacles with QMIX
             stage_env = create_stage3_env()
             
             # Initialize multi-agent networks from stage 2 knowledge
             agent = initialize_multi_agent_networks(agent, stage_env)
             
+            # Configure QMIX for multiple agents
+            configure_agent_for_qmix(agent, stage_env)
+            
             agent, exit_reason, eval_history, benchmark, stage_model_path = train_stage(
-                3, STAGE_NAMES, stage_env, agent, STAGE_STEPS[3], STAGE_SAVE_FREQ[3]
+                3, STAGE_NAMES, stage_env, agent, STAGE_STEPS[3], STAGE_SAVE_FREQ[3], use_qmix=True
             )
             
             results["stage3_eval_history"] = eval_history
@@ -875,6 +877,10 @@ def train_DQN_curriculum(target_env, n_episodes=1000, max_steps=1000, debug_leve
             break
         elif exit_reason == "nextphase":
             current_stage += 1  # Move to next stage
+            if agent is not None:
+                # Explicitly update phase attribute when moving to next stage
+                agent.phase = current_stage
+                print(f"Updated agent phase to {current_stage}")
         elif exit_reason == "continue":
             # Stay in current stage - do nothing
             pass
@@ -896,5 +902,70 @@ def train_DQN_curriculum(target_env, n_episodes=1000, max_steps=1000, debug_leve
                   f"Ratio: {benchmark['performance_ratio']:.2f}")
 
     return results
+
+def configure_agent_for_qmix(agent, env):
+    """
+    Configure an existing agent to use QMIX with the given environment.
+    This handles both initial setup and reconfiguration when changing environments.
+    
+    Args:
+        agent: The QLAgent to configure
+        env: The environment to use for QMIX configuration
+    """
+    print(f"Configuring agent for QMIX with {len(env.agents)} agents")
+    
+    # Enable QMIX
+    agent.use_qmix = True
+
+    # Update agent's phase if environment has changed significantly
+    # (This is important when transitioning between stages)
+    if (hasattr(agent, 'prev_env_size') and 
+        agent.prev_env_size != env.grid_size):
+        print(f"Environment size changed from {agent.prev_env_size} to {env.grid_size}")
+    
+    # Get sample global state to determine dimensions
+    dummy_state, _ = env.get_global_state()
+    state_dim = dummy_state.shape[0]
+    
+    # Check if we need to create or resize the mixer
+    needs_new_mixer = (
+        not hasattr(agent, 'mixer') or
+        agent.mixer is None or
+        # Check if number of agents changed
+        agent.mixer.num_agents != len(env.agents) or
+        # Check if state dimension changed
+        agent.mixer.state_dim != state_dim
+    )
+    
+    if needs_new_mixer:
+        print(f"Creating new mixer network: {len(env.agents)} agents, state_dim={state_dim}")
+        # Initialize QMIX networks
+        from .qnet import QMixNetwork
+        agent.mixer = QMixNetwork(len(env.agents), state_dim).to(device)
+        agent.target_mixer = QMixNetwork(len(env.agents), state_dim).to(device)
+        agent.target_mixer.load_state_dict(agent.mixer.state_dict())
+        agent.mixer_optimizer = torch.optim.AdamW(
+            agent.mixer.parameters(), lr=agent.alpha, eps=1e-5, weight_decay=0.0001
+        )
+    
+    # Always recreate the replay buffer when changing environments
+    # This ensures we don't keep experiences from a different environment
+    from .replay import QMIXReplayBuffer
+    buffer_size = agent.memory.buffer_size if hasattr(agent, 'memory') else 50000
+    batch_size = agent.batch_size if hasattr(agent, 'batch_size') else 64
+    use_per = agent.use_per if hasattr(agent, 'use_per') else True
+    
+    # Initialize QMIX replay buffer
+    agent.qmix_memory = QMIXReplayBuffer(buffer_size, batch_size, use_priority=use_per)
+    
+    # Store agent order for consistent batch processing
+    agent.agent_ids = sorted(list(env.agents))
+    
+    # Log QMIX configuration
+    if hasattr(agent, 'writer') and agent.writer is not None:
+        if len(env.agents) == 1:
+            agent.writer.add_text("Training", f"Using QMIX for single agent with global state ({state_dim} dims)")
+        else:
+            agent.writer.add_text("Training", f"Using QMIX for {len(env.agents)} agents with global state ({state_dim} dims)")
 
 

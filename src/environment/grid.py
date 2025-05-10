@@ -18,11 +18,12 @@ class WarehouseEnv(ParallelEnv):
     metadata = {'render_modes': ['human', 'rgb_array'], 'name': 'warehouse_v0'}
 
     def __init__(self, grid_size=(20, 20), human_grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, 
-                 num_pickup_points=3, num_dropoff_points=2, seed=None,
+                 num_pickup_points=3, num_dropoff_points=2, seed=None, env_name="default",
                  observation_size=(5, 5), render_mode=None, use_frame_stack=True, n_frames=4):
         super().__init__()
 
         # Environment parameters
+        self.env_name = env_name
         self.grid_size = grid_size
         self.human_grid_size = human_grid_size
         self.observation_size = observation_size
@@ -866,27 +867,38 @@ class WarehouseEnv(ParallelEnv):
     
     def get_global_state(self):
         """
-        Get the global state of the environment (for CTDE)
+        Get the global state of the environment for CTDE algorithms like QMIX.
+        Returns a flattened representation suitable for use with mixing networks.
         """
-
         # Create a full grid representation with multiple channels
-        global_state = np.zeros((6,) + self.grid_size, dtype=np.float32)
+        global_state = np.zeros((8,) + self.grid_size, dtype=np.float32)
 
-        # Channel 0: All agents' positions (combines 'agent position' and 'other agents' positions')
+        # Channel 0: All agents' positions
         for agent, pos in self.agent_positions.items():
             global_state[0, pos[0], pos[1]] = 1
 
         # Channel 1: Shelves (static obstacles)
         for i in range(self.grid_size[0]):
             for j in range(self.grid_size[1]):
-                if self.grid[i, j] == 2:
+                if self.grid[i, j] == 2:  # Shelf
                     global_state[1, i, j] = 1
 
-        # Channel 2: Dynamic obstacles
-        for i in range(self.grid_size[0]):
-            for j in range(self.grid_size[1]):
-                if self.grid[i, j] == 3:
-                    global_state[2, i, j] = 1
+        # Channel 2: Dynamic obstacles (humans) with count encoding
+        # First count humans at each position
+        human_counts = {}
+        for human in self.humans:
+            pos = self.human_positions[human]
+            if pos in human_counts:
+                human_counts[pos] += 1
+            else:
+                human_counts[pos] = 1
+        
+        # Then encode the counts (normalized to [0,1] range)
+        max_humans_per_cell = max(human_counts.values()) if human_counts else 1
+        for pos, count in human_counts.items():
+            # Normalize the count (1 human = 0.5, 2 humans = 0.75, etc.)
+            # This ensures we capture the density information in a normalized way
+            global_state[2, pos[0], pos[1]] = min(1.0, count / (max_humans_per_cell + 1) + 0.5)
 
         # Channel 3: Pickup points
         for pos in self.pickup_points:
@@ -902,16 +914,37 @@ class WarehouseEnv(ParallelEnv):
                 pos = self.agent_positions[agent]
                 global_state[5, pos[0], pos[1]] = 1
 
-        # Additional info as a dictionary
+        # Channel 6: Agent goals
+        for agent, goal in self.agent_goals.items():
+            global_state[6, goal[0], goal[1]] += 1  # Add for each agent targeting this goal
+
+        # Channel 7: Agent-goal assignments (which agent is going for which goal)
+        # We create a unique encoding for each agent-goal pair
+        # This helps the mixer understand which agent is responsible for which goal
+        agent_indices = {agent: i for i, agent in enumerate(self.agents)}
+        for agent, goal in self.agent_goals.items():
+            if agent in agent_indices:
+                # Normalize the agent index to [0,1]
+                agent_idx_norm = (agent_indices[agent] + 1) / (len(self.agents) + 1)
+                # Store at both agent position and goal position to help coordination
+                agent_pos = self.agent_positions[agent]
+                global_state[7, agent_pos[0], agent_pos[1]] = agent_idx_norm
+                global_state[7, goal[0], goal[1]] = agent_idx_norm
+
+        # Flatten the state for the mixing network
+        # Shape will be (channels * height * width)
+        flat_state = global_state.reshape(-1)
+        
+        # Additional info as a dictionary (not used by QMIX directly but useful for debugging)
         additional_info = {
             "agent_goals": {agent: goal for agent, goal in self.agent_goals.items()},
             "agent_carrying": self.agent_carrying,
-            "agent_item_types": self.agent_item_types,
             "steps": self.steps,
-            "completed_tasks": self.completed_tasks
+            "completed_tasks": self.completed_tasks,
+            "human_counts": human_counts
         }
 
-        return global_state, additional_info
+        return flat_state, additional_info
 
     def _place_shelves(self):
         """
@@ -1279,7 +1312,7 @@ class WarehouseFrameStack:
             agent: deque(
                 [obs[agent].copy() for _ in range(self.n_frames)], 
                 maxlen=self.n_frames) 
-        for agent in self.agents}
+        for agent in self.env.agents}
 
         # Create stacked observations
         stacked_obs = {}
@@ -1304,7 +1337,7 @@ class WarehouseFrameStack:
             stacked_obs[agent] = np.concatenate(list(self.frames[agent]), axis=0)
 
         return stacked_obs, rewards, terminated, truncated, info
-    
+
     def __getattr__(self, name):
         """
         Delegate attribute access to underlying environment
@@ -1316,10 +1349,10 @@ class WarehouseFrameStack:
 
 # Wrapper for the environment
 def env(grid_size=(20, 20), human_grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, 
-        num_pickup_points=3, num_dropoff_points=2, render_mode=None, n_frames=8, use_frame_stack=True, seed=None):
+        num_pickup_points=3, num_dropoff_points=2, render_mode=None, n_frames=8, use_frame_stack=True, seed=None, env_name="default"):
 
     base_env = WarehouseEnv(grid_size=grid_size, n_agents=n_agents, n_humans=n_humans, human_grid_size=human_grid_size, num_shelves=num_shelves,   num_pickup_points=num_pickup_points, num_dropoff_points=num_dropoff_points, render_mode=render_mode, n_frames=n_frames, use_frame_stack=use_frame_stack,
-                            seed=seed)
+                            seed=seed, env_name=env_name)
 
     if use_frame_stack:
         return WarehouseFrameStack(base_env)

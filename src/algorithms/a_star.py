@@ -71,8 +71,14 @@ class AStarAgent:
         # Get global state for planning
         global_state, additional_info = self.env.get_global_state()
 
-        # Extract obstacle map (1 = obstacle, 0 = free space)
-        obstacle_map = global_state[1].copy()
+        # Extract obstacle map from the global state (channel 1 is shelves)
+        # First reshape global_state back to its multi-channel grid form
+        channels = 8  # Based on your current implementation
+        height, width = self.env.grid_size
+        reshaped_state = global_state.reshape(channels, height, width)
+        
+        # Extract obstacle map (shelves)
+        obstacle_map = reshaped_state[1].copy()  # Channel 1 is shelves
 
         # Debug print obstacle map shape
         self.debug(DEBUG_VERBOSE, f"Obstacle map shape: {obstacle_map.shape}, Grid size: {self.env.grid_size}")

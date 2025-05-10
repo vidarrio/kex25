@@ -11,8 +11,6 @@ models_dir = os.path.join(current_dir, 'models')
 model_name = CURRENT_VERSION + ".pth"
 model_path = os.path.join(models_dir, model_name)
 
-
-
 def get_env(env_name):
     # Environments
     stage1_env = env(grid_size=(5, 5), n_agents=1, n_humans=0, num_shelves=0, 

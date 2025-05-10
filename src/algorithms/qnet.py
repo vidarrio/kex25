@@ -172,14 +172,22 @@ class QMixNetwork(nn.Module):
         # Second layer (output)
         self.hyper_w2 = nn.Linear(state_dim, mixing_embed_dim)
         self.hyper_b2 = nn.Linear(state_dim, 1)
+        
+        # Initialize weights with Glorot
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                # Xavier/Glorot initialization for better stability
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
 
     def forward(self, agent_qs, state):
         """
         Forward pass through the mixing network.
 
         Args:
-            agent_qs: Individual Q-values from agents.
-            state: Global state information.
+            agent_qs: Individual Q-values from agents [batch_size, num_agents].
+            state: Global state information [batch_size, state_dim].
         """
 
         batch_size = agent_qs.size(0)
@@ -195,4 +203,4 @@ class QMixNetwork(nn.Module):
 
         # Output
         joint_q = torch.bmm(hidden, w2) + b2
-        return joint_q.squeeze(1)
+        return joint_q.squeeze(-1)

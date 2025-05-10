@@ -10,8 +10,8 @@ import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
 
 # Local application imports
-from .qnet import QNetwork
-from .replay import ReplayBuffer, PrioritizedReplayBuffer, Experience
+from .qnet import QNetwork, QMixNetwork
+from .replay import ReplayBuffer, PrioritizedReplayBuffer, Experience, QMIXReplayBuffer
 from .common import device, get_model_path, DEBUG_NONE, DEBUG_CRITICAL, DEBUG_INFO, DEBUG_VERBOSE, DEBUG_ALL, DEBUG_SPECIFIC
 
 class QLAgent:
@@ -23,7 +23,7 @@ class QLAgent:
                  alpha=0.00025, gamma=0.99, epsilon_start=1.0, epsilon_end=0.1,
                  epsilon_decay=0.995, hidden_size=128, buffer_size=200000, batch_size=64,
                  update_freq=8, tau=0.0005, use_tensorboard=False, use_per=True, use_softmax=False,
-                 use_qmix=True):
+                 use_qmix=False):
         """
         Initialize the Q-learning agent.
 
@@ -44,7 +44,7 @@ class QLAgent:
             use_tensorboard: Whether to use TensorBoard for logging (default: False).
             use_per: Whether to use prioritized experience replay (default: True).
             use_softmax: Whether to use softmax action selection (default: False).
-            use_qmix: Whether to use QMIX for multi-agent training (default: True).
+            use_qmix: Whether to use QMIX for multi-agent training (default: False).
         """
         
         self.env = env
@@ -83,11 +83,31 @@ class QLAgent:
             self.target_networks[agent].load_state_dict(self.q_networks[agent].state_dict())
             self.optimizers[agent] = torch.optim.AdamW(self.q_networks[agent].parameters(), lr=alpha, eps=1e-5, weight_decay=0.0001)
 
-        # Initialize replay buffer
-        if use_per:
-            self.memory = PrioritizedReplayBuffer(buffer_size, batch_size)
+        # Add QMIX-specific components if enabled
+        self.use_qmix = use_qmix
+        if self.use_qmix:
+            # Calculate state dimension based on global state shape
+            # Get a sample global state to determine dimensions
+            dummy_state, _ = env.get_global_state()
+            state_dim = dummy_state.shape[0]  # Flattened state size
+            
+            # Initialize QMIX networks
+            self.mixer = QMixNetwork(len(env.agents), state_dim).to(device)
+            self.target_mixer = QMixNetwork(len(env.agents), state_dim).to(device)
+            # Copy weights from mixer to target mixer
+            self.target_mixer.load_state_dict(self.mixer.state_dict())
+            self.mixer_optimizer = torch.optim.AdamW(
+                self.mixer.parameters(), lr=alpha, eps=1e-5, weight_decay=0.0001
+            )
+            
+            # If using PER, the QMIX buffer will handle it
+            self.qmix_memory = QMIXReplayBuffer(buffer_size, batch_size, use_priority=self.use_per)
         else:
-            self.memory = ReplayBuffer(buffer_size, batch_size)
+            # Standard replay buffer initialization (your existing code)
+            if use_per:
+                self.memory = PrioritizedReplayBuffer(buffer_size, batch_size)
+            else:
+                self.memory = ReplayBuffer(buffer_size, batch_size)
 
         # Initialize hyperparameters
         self.alpha = alpha
@@ -126,6 +146,7 @@ class QLAgent:
                 'frame_history': self.frame_history,
                 'use_per': use_per,
                 'use_softmax': use_softmax,
+                'use_qmix': use_qmix,
             }
 
             # Add as text summary
@@ -446,17 +467,20 @@ class QLAgent:
 
     def save_model(self, model_path=None):
         """
-        Save the Q-network model to the specified path.
+        Save the Q-network model and QMIX mixer (if used) to the specified path.
         """
-
+        # Save all agent networks
         model_data = {
             agent: self.q_networks[agent].state_dict()
             for agent in self.env.agents
         }
+        
+        # If using QMIX, also save the mixer
+        if self.use_qmix and len(self.env.agents) > 1:
+            model_data['mixer'] = self.mixer.state_dict()
 
         if model_path is None:
             model_path = get_model_path()
-        
 
         if model_path.endswith('.pth'):
             save_path = model_path
@@ -468,13 +492,23 @@ class QLAgent:
 
     def load_model(self, filepath=get_model_path()):
         """
-        Load the Q-network model from the specified path.
+        Load the Q-network model and QMIX mixer (if available) from the specified path.
         """
-
         model_data = torch.load(filepath, map_location=device)
+        
+        # Load agent networks
         for agent in self.env.agents:
-            self.q_networks[agent].load_state_dict(model_data[agent])
-            self.target_networks[agent].load_state_dict(model_data[agent])
+            if agent in model_data:
+                self.q_networks[agent].load_state_dict(model_data[agent])
+                self.target_networks[agent].load_state_dict(model_data[agent])
+            else:
+                print(f"Warning: No model data found for agent {agent}")
+        
+        # Load mixer if using QMIX and it's in the saved model
+        if self.use_qmix and 'mixer' in model_data:
+            self.mixer.load_state_dict(model_data['mixer'])
+            self.target_mixer.load_state_dict(model_data['mixer'])
+            print("Loaded QMIX mixer from saved model")
         
     def _learn(self, agent, experiences=None):
         """
@@ -698,3 +732,163 @@ class QLAgent:
         else:
             # After that, prefer argmax
             return 'argmax'
+
+    def step_qmix(self, states, actions, rewards, next_states, dones, global_state, next_global_state):
+        """
+        Store experience with global state information and perform QMIX learning.
+        Works for both single and multi-agent scenarios.
+        """
+
+        current_agents = list(self.env.agents)
+
+        # Handle case based on number of agents
+        if len(current_agents) == 1:
+            # For single agent, still use QMIX but as a state-augmentation technique
+            agent = current_agents[0]  # Get the single agent
+            
+            # Create agent arrays with shape [1, ...] for the single agent
+            agent_states = np.expand_dims(states[agent], axis=0)
+            agent_actions = np.expand_dims(actions[agent], axis=0)
+            agent_rewards = np.expand_dims(rewards[agent], axis=0)
+            agent_next_states = np.expand_dims(next_states[agent], axis=0)
+            agent_dones = np.expand_dims(dones[agent], axis=0)
+        else:
+            # Use consistent ordering of agents
+            sorted_agents = sorted(current_agents)
+            # Multi-agent case - convert dictionaries to arrays for batch processing
+            agent_states = np.array([states[agent] for agent in sorted_agents])
+            agent_actions = np.array([actions[agent] for agent in sorted_agents])
+            agent_rewards = np.array([rewards[agent] for agent in sorted_agents])
+            agent_next_states = np.array([next_states[agent] for agent in sorted_agents])
+            agent_dones = np.array([dones[agent] for agent in sorted_agents])
+        
+        # Add to QMIX replay buffer
+        self.qmix_memory.add(
+            agent_states, agent_actions, agent_rewards,
+            agent_next_states, agent_dones,
+            global_state, next_global_state
+        )
+        
+        # Increment step counter
+        self.t_step += 1
+        
+        # Learn every update_freq steps as long as we have enough samples
+        if self.t_step % self.update_freq == 0 and len(self.qmix_memory) >= self.batch_size:
+            self._learn_qmix()
+
+    def _learn_qmix(self):
+        """
+        Update Q-networks and mixer using QMIX algorithm.
+        Supports both single and multi-agent scenarios.
+        """
+        # Sample batch of experiences
+        batch = self.qmix_memory.sample()
+        if batch is None:  # Not enough samples
+            return
+            
+        if self.use_per:
+            agent_states, agent_actions, agent_rewards, agent_next_states, agent_dones, \
+            global_states, next_global_states, weights, indices = batch
+        else:
+            agent_states, agent_actions, agent_rewards, agent_next_states, agent_dones, \
+            global_states, next_global_states, weights, indices = batch
+        
+        batch_size = agent_states.shape[0]
+        
+        # Always use current environment agents
+        current_agents = sorted(list(self.env.agents))
+        num_agents = len(current_agents)
+        
+        # Calculate chosen Q-values for each agent
+        chosen_action_qvals = []
+        for agent_idx, agent in enumerate(current_agents):
+            q_values = self.q_networks[agent](agent_states[:, agent_idx])
+            chosen_action_qval = q_values.gather(1, agent_actions[:, agent_idx].unsqueeze(1))
+            chosen_action_qvals.append(chosen_action_qval)
+        
+        # Stack all agents' Q-values
+        chosen_action_qvals = torch.cat(chosen_action_qvals, dim=1)  # [batch_size, num_agents]
+        
+        # Mix the individual Q-values using the mixer network
+        mixed_qvals = self.mixer(chosen_action_qvals, global_states)
+        
+        # Calculate target Q-values using Double DQN
+        target_max_qvals = []
+        for agent_idx, agent in enumerate(current_agents):
+            # Get greedy actions from current policy
+            next_q = self.q_networks[agent](agent_next_states[:, agent_idx])
+            next_actions = next_q.max(dim=1, keepdim=True)[1]
+            
+            # Get Q-values for these actions from target network
+            target_q = self.target_networks[agent](agent_next_states[:, agent_idx])
+            target_max_q = target_q.gather(1, next_actions)
+            target_max_qvals.append(target_max_q)
+        
+        # Stack target Q-values
+        target_max_qvals = torch.cat(target_max_qvals, dim=1)  # [batch_size, num_agents]
+        
+        # Mix target Q-values using target mixer
+        target_mixed = self.target_mixer(target_max_qvals, next_global_states)
+        
+        # For single agent, reward sum is just the agent's reward
+        # For multi-agent, it's the sum across agents
+        if num_agents == 1:
+            rewards_for_critic = agent_rewards
+        else:
+            rewards_for_critic = agent_rewards.sum(dim=1, keepdim=True)
+        
+        # Use done flag similarly
+        if num_agents == 1:
+            done_mask = agent_dones
+        else:
+            done_mask = agent_dones.max(dim=1, keepdim=True)[0]
+        
+        # Calculate targets with TD update
+        targets = rewards_for_critic + self.gamma * target_mixed * (1 - done_mask)
+        
+        # If using PER, calculate TD errors for priority updates
+        td_error = (targets - mixed_qvals).detach()
+        
+        # Calculate loss (use weights if PER is enabled)
+        if self.use_per:
+            loss = (weights * F.smooth_l1_loss(mixed_qvals, targets.detach(), reduction='none')).mean()
+        else:
+            loss = F.smooth_l1_loss(mixed_qvals, targets.detach())
+        
+        # Log metrics if tensorboard is enabled
+        if self.use_tensorboard:
+            self.writer.add_scalar('QMIX/Loss', loss.item(), self.t_step)
+            self.writer.add_scalar('QMIX/TD_Error', td_error.abs().mean().item(), self.t_step)
+            self.writer.add_scalar('QMIX/Q_Value', mixed_qvals.mean().item(), self.t_step)
+            self.writer.add_scalar('QMIX/Target_Value', targets.mean().item(), self.t_step)
+        
+        # Zero gradients
+        self.mixer_optimizer.zero_grad(set_to_none=True)
+        for agent in current_agents:
+            self.optimizers[agent].zero_grad(set_to_none=True)
+        
+        # Compute gradients
+        loss.backward()
+        
+        # Clip gradients to prevent explosion
+        for agent in current_agents:
+            torch.nn.utils.clip_grad_norm_(
+                self.q_networks[agent].parameters(), max_norm=1.0
+            )
+        torch.nn.utils.clip_grad_norm_(
+            self.mixer.parameters(), max_norm=1.0
+        )
+        
+        # Apply gradients
+        self.mixer_optimizer.step()
+        for agent in current_agents:
+            self.optimizers[agent].step()
+        
+        # Update target networks
+        self._soft_update(self.mixer, self.target_mixer, self.tau)
+        for agent in current_agents:
+            self._soft_update(self.q_networks[agent], self.target_networks[agent], self.tau)
+        
+        # Update priorities in replay buffer if using PER
+        if self.use_per and indices is not None:
+            self.qmix_memory.update_priorities(indices, td_error.cpu().numpy())
