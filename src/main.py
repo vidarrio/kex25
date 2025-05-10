@@ -17,7 +17,7 @@ def get_env(env_name):
     # Environments
     stage1_env = env(grid_size=(5, 5), n_agents=1, n_humans=0, num_shelves=0, 
                     num_pickup_points=1, num_dropoff_points=1, render_mode="human")
-    stage2_env = env(grid_size=(10, 8), n_agents=1, n_humans=0, num_shelves=16, 
+    stage2_env = env(grid_size=(10, 8), human_grid_size=(10, 8), n_agents=1, n_humans=0, num_shelves=16, 
                         num_pickup_points=1, num_dropoff_points=1, render_mode="human")
     stage3_env = env(grid_size=(25, 25), n_agents=1, n_humans=0, num_shelves=50, 
                         num_pickup_points=1, num_dropoff_points=1, render_mode="human")
@@ -37,16 +37,16 @@ def get_env(env_name):
         raise ValueError("Invalid environment name.")
 
 
-def start_DQN_eval():
+def start_DQN_eval(model_path=None):
     # Run DQN agent
-    run_q_learning(stage1_env, n_steps=1000, model_path=model_path)
+    run_q_learning(get_env("warehouse"), n_steps=1000, full_model_path=model_path)
 
 def start_DQN_training():
     # Train DQN agent
     train_DQN_curriculum(get_env("warehouse"), n_episodes=1000, max_steps=1000, save_every=100, model_path=model_path)
 
 def test_a_star():
-    run_a_star(warehouse_env, n_steps=1000, debug_level=5)
+    run_a_star(get_env("warehouse"), n_steps=1000, debug_level=0)
 
 def start_dqn_training_no_curriculum():
     # Train DQN agent without curriculum
@@ -83,7 +83,9 @@ def main(task, argv=None):
     elif task == "dqn_train_nc":
         start_dqn_training_no_curriculum()
     elif task == "dqn_eval":
-        start_DQN_eval()
+        model = argv[0] if argv else None
+        if model:
+            start_DQN_eval(model_path=models_dir + "/" + model)
     elif task == "benchmark":
         benchmark_agents()
     elif task == "manual_benchmark":

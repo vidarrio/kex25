@@ -26,7 +26,7 @@ class WarehouseEnv(ParallelEnv):
         self.grid_size = grid_size
         self.human_grid_size = human_grid_size
         self.observation_size = observation_size
-        self.observation_channels = 14
+        self.observation_channels = 10
         self.n_agents = n_agents
         self.n_humans = n_humans
         self.num_shelves = num_shelves
@@ -260,8 +260,17 @@ class WarehouseEnv(ParallelEnv):
             new_pos = final_human_positions[human]
 
             if current_pos != new_pos:
-                # Clear old position in grid
-                self.grid[current_pos] = 0
+                # Check if other humans are at current position before clearing
+                other_humans_here = [h for h in self.humans if h != human and self.human_positions[h] == current_pos]
+                if other_humans_here:
+                    pass
+                elif current_pos in self.pickup_points:
+                    self.grid[current_pos] = 4
+                elif current_pos in self.dropoff_points:
+                    self.grid[current_pos] = 5
+                else:
+                    # Clear old position in grid
+                    self.grid[current_pos] = 0
                 # Update human position
                 self.human_positions[human] = new_pos
                 # Mark new position in grid
@@ -329,8 +338,17 @@ class WarehouseEnv(ParallelEnv):
             new_pos = final_positions[agent]
 
             if current_pos != new_pos:
-                # Clear old position in grid
-                self.grid[current_pos] = 0
+                # Check if other agents are at current position before clearing
+                other_agents_here = [a for a in self.agents if a != agent and self.agent_positions[a] == current_pos]
+                if other_agents_here:
+                    pass
+                elif current_pos in self.pickup_points:
+                    self.grid[current_pos] = 4  # Pickup point
+                elif current_pos in self.dropoff_points:
+                    self.grid[current_pos] = 5
+                else:
+                    # Clear old position in grid
+                    self.grid[current_pos] = 0
                 # Update agent position
                 self.agent_positions[agent] = new_pos
                 # Mark new position in grid
@@ -559,14 +577,30 @@ class WarehouseEnv(ParallelEnv):
                             label=f"Agent {i} ({carry_status})")
                 )
 
-            # Draw humans as black circles
+            # Draw humans as black circles with count indicators for stacking
+            human_positions_count = {}
             for human in self.humans:
-                human_color = "black"
                 pos = self.human_positions[human]
+                # Count humans at each position
+                if pos not in human_positions_count:
+                    human_positions_count[pos] = 1
+                else:
+                    human_positions_count[pos] += 1
+
+            # Now draw humans with count indicators
+            for pos, count in human_positions_count.items():
+                human_color = "black"
                 
+                # Draw the circle for humans
                 self.ax.scatter(pos[1], pos[0], s=180, marker='o',
                                 color=human_color,
                                 edgecolors='black', linewidth=1.5)
+                
+                # Add count text if more than one human
+                if count > 1:
+                    self.ax.text(pos[1], pos[0], str(count), 
+                                ha='center', va='center', fontsize=12, 
+                                fontweight='bold', color='white')
             
             # Add environment legend
             first_legend = self.ax.legend(handles=env_legend_elements,
@@ -688,33 +722,37 @@ class WarehouseEnv(ParallelEnv):
                 lr, lc = i + window_size, j + window_size
 
                 # Check if the global coordinates are within bounds
-                if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
-                    # Channel 1: Agent position (only at the center)
-                    if i == 0 and j == 0:
-                        obs[0, lr, lc] = 1
+                if (gr < 0 or gr >= self.grid_size[0] or 
+                    gc < 0 or gc >= self.grid_size[1]):
+                    obs[2, lr, lc] = 1 # Out of bounds (static obstacle)
+                    continue # Skip further processing for this cell
+                    
+                # Channel 1: Agent position (only at the center)
+                if i == 0 and j == 0:
+                    obs[0, lr, lc] = 1
 
-                    # Channel 2: Other agents' positions
-                    cell_has_other_agent = False
-                    for other_agent in self.agents:
-                        if other_agent != agent and self.agent_positions[other_agent] == (gr, gc):
-                            cell_has_other_agent = True
-                            break
-                    obs[1, lr, lc] = 1 if cell_has_other_agent else 0
+                # Channel 2: Other agents' positions
+                cell_has_other_agent = False
+                for other_agent in self.agents:
+                    if other_agent != agent and self.agent_positions[other_agent] == (gr, gc):
+                        cell_has_other_agent = True
+                        break
+                obs[1, lr, lc] = 1 if cell_has_other_agent else 0
 
-                    # Channel 3: Static obstacles (shelves)
-                    obs[2, lr, lc] = 1 if self.grid[gr, gc] == 2 else 0
+                # Channel 3: Static obstacles (shelves)
+                obs[2, lr, lc] = 1 if self.grid[gr, gc] == 2 else 0
 
-                    # Channel 4: Dynamic obstacles
-                    obs[3, lr, lc] = 1 if self.grid[gr, gc] == 3 else 0
+                # Channel 4: Dynamic obstacles
+                obs[3, lr, lc] = 1 if self.grid[gr, gc] == 3 else 0
 
-                    # Channel 5: Current goal position
-                    obs[4, lr, lc] = 1 if (gr, gc) == self.agent_goals[agent] else 0
+                # Channel 5: Current goal position
+                obs[4, lr, lc] = 1 if (gr, gc) == self.agent_goals[agent] else 0
 
-                    # Channel 6: Pickup points
-                    obs[5, lr, lc] = 1 if (gr, gc) in self.pickup_points else 0
+                # Channel 6: Pickup points
+                obs[5, lr, lc] = 1 if (gr, gc) in self.pickup_points else 0
 
-                    # Channel 7: Dropoff points
-                    obs[6, lr, lc] = 1 if (gr, gc) in self.dropoff_points else 0
+                # Channel 7: Dropoff points
+                obs[6, lr, lc] = 1 if (gr, gc) in self.dropoff_points else 0
 
         # Channel 8: Agent's carrying status
         obs[7, :, :] = 1 if self.agent_carrying[agent] else 0
@@ -743,30 +781,39 @@ class WarehouseEnv(ParallelEnv):
         # Channel 10: Goal direction as normalized relative coordinates (0-1)
 
         # Calculate direction vector from agent to goal
-        dr = goal_pos[0] - agent_pos[0]  # row difference (y)
-        dc = goal_pos[1] - agent_pos[1]  # column difference (x)
+        goal_dr = goal_pos[0] - agent_pos[0]  # row difference (y)
+        goal_dc = goal_pos[1] - agent_pos[1]  # column difference (x)
+        goal_dist = abs(goal_dr) + abs(goal_dc)  # Manhattan distance
 
-        # Normalize to range [0, 1]
-        max_dist = 2 * max(self.grid_size[0], self.grid_size[1])  # 2x to handle negative values
-        norm_dr = (dr + max_dist/2) / max_dist  # Shift from [-max/2, max/2] to [0, 1]
-        norm_dc = (dc + max_dist/2) / max_dist
+        if goal_dist > 0:
+            # Normalize direction vector (unit vector)
+            dr_norm = goal_dr / goal_dist
+            dc_norm = goal_dc / goal_dist
+        else:
+            # If agent is at the goal, set direction to zero
+            dr_norm = 0
+            dc_norm = 0
+
+        # Max distance for normalization
+        max_dist = self.grid_size[0] + self.grid_size[1]  # Maximum possible distance in the grid
+
+        # Normalize distance
+        norm_dist = min(1.0, goal_dist / max_dist)
 
         # Fill channel with normalized direction values
         obs[9, :, :] = 0  # Reset channel
-        obs[9, 0, :] = norm_dr  # First row encodes vertical direction
-        obs[9, :, 0] = norm_dc  # First column encodes horizontal direction
+        obs[9, window_size, window_size] = norm_dist  # Distance at the center
+        # Vertical direction
+        if dr_norm > 0:
+            obs[9, window_size - 1, window_size] = dr_norm # Up
+        elif dr_norm < 0:
+            obs[9, window_size + 1, window_size] = dr_norm # Down
+        # Horizontal direction
+        if dc_norm > 0:
+            obs[9, window_size, window_size + 1] = dc_norm # Right
+        elif dc_norm < 0:
+            obs[9, window_size, window_size - 1] = dc_norm # Left
 
-        # Channel 11: Agent's global row coordinate (normalized to [0, 1])
-        #obs[10, :, :] = agent_pos[0] / (self.grid_size[0] - 1)
-
-        # Channel 12: Agent's global column coordinate (normalized to [0, 1])
-        #obs[11, :, :] = agent_pos[1] / (self.grid_size[1] - 1)
-
-        # Channel 13: Goal's global row coordinate (normalized to [0, 1])
-        #obs[12, :, :] = goal_pos[0] / (self.grid_size[0] - 1)
-
-        # Channel 14: Goal's global column coordinate (normalized to [0, 1])
-        #obs[13, :, :] = goal_pos[1] / (self.grid_size[1] - 1)
 
         return obs
     
@@ -1033,6 +1080,9 @@ class WarehouseEnv(ParallelEnv):
                     # Successful pickup
                     self.agent_carrying[agent] = True
                     rewards[agent] += self.task_reward
+
+                    # Clear position history to avoid revisit penalty
+                    self.position_history[agent] = []
                     
                     # Assign new goal
                     pickup_idx = self.pickup_points.index(current_pos)
@@ -1052,6 +1102,9 @@ class WarehouseEnv(ParallelEnv):
                     self.agent_carrying[agent] = False
                     rewards[agent] += self.task_reward
                     self.completed_tasks[agent] += 1
+
+                    # Clear position history to avoid revisit penalty
+                    self.position_history[agent] = []
                     
                     # Record last goal before assigning new one
                     if not hasattr(self, 'last_goals'):
@@ -1066,7 +1119,6 @@ class WarehouseEnv(ParallelEnv):
         max_dist = self.grid_size[0] + self.grid_size[1]
         return -self._calculate_path_distance(pos, goal) / max_dist 
 
-    #@functools.lru_cache(maxsize=1024)
     def _calculate_path_distance(self, current_pos, goal_pos):
         """Calculate a more meaningful distance considering obstacles"""
         

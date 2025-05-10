@@ -10,9 +10,12 @@ class SimpleHumanPlanner:
         """
         Initialize the simple human planner with position history
         """
-        self.last_positions = {}  # Stores the last position for each human
-        self.position_history = {}  # Stores recent positions to detect cycles
-        self.history_length = 8  # How many recent positions to track for cycle detection
+        self.position_history = {}  # Track position history for each human
+        self.last_positions = {}    # Track last position for each human
+        self.history_length = 12    # Keep track of last 12 positions
+        # Add tracking for consecutive waits
+        self.wait_counts = {}       # Track consecutive waits for each human
+        self.max_consecutive_waits = 5  # Maximum allowed consecutive waits
 
     def get_actions(self, humans, human_positions, human_goals, grid_size, grid):
         """
@@ -29,6 +32,10 @@ class SimpleHumanPlanner:
             if human not in self.position_history:
                 self.position_history[human] = []
             
+            # Initialize wait count for this human if needed
+            if human not in self.wait_counts:
+                self.wait_counts[human] = 0
+            
             # Check if we're in a cycle (same position visited multiple times)
             if self._is_in_cycle(human, current):
                 # Break the cycle by assigning a new random goal
@@ -37,8 +44,33 @@ class SimpleHumanPlanner:
                 goal = human_goals[human]
                 # Clear the position history to start fresh
                 self.position_history[human] = []
+                # Reset wait count
+                self.wait_counts[human] = 0
             
+            # Get action using current position and goal
             action = self.compute_action(current, goal, human, human_goals, grid_size, grid)
+            
+            # Track consecutive waits
+            if action == 6:  # Wait action
+                self.wait_counts[human] += 1
+                
+                # If too many consecutive waits, try to break the cycle
+                if self.wait_counts[human] >= self.max_consecutive_waits:
+                    # Try to force movement in any valid direction
+                    forced_action = self._force_movement(current, human, grid_size, grid)
+                    if forced_action != 6:  # If we found a valid movement
+                        action = forced_action
+                        self.wait_counts[human] = 0  # Reset wait count
+                        # print(f"Human {human} breaking wait cycle with action {action}")
+                    else:
+                        # If still stuck, assign a new goal
+                        assign_new_human_goal(human, human_goals, grid, grid_size)
+                        # print(f"Human {human} assigned new goal due to excessive waiting")
+                        self.wait_counts[human] = 0
+            else:
+                # Reset wait count if not waiting
+                self.wait_counts[human] = 0
+            
             human_actions[human] = action
             
             # Update the position history
@@ -219,9 +251,50 @@ class SimpleHumanPlanner:
                 return action
             # Continue trying other actions even if blocked by agent
         
-        print(f"Human {human} is blocked in all directions. Waiting.")
+        # print(f"Human {human} is blocked in all directions. Waiting.")
         
         # If no valid move is found, wait
+        return 6
+
+    def _force_movement(self, current, human, grid_size, grid):
+        """
+        Force the human to move in any valid direction when stuck in a waiting cycle.
+        Try directions in random order to avoid getting stuck in another pattern.
+        """
+        cur_row, cur_col = current
+        
+        # Define possible moves (same as in compute_action)
+        moves = {
+            0: (0, -1),  # LEFT
+            1: (1, 0),   # DOWN
+            2: (0, 1),   # RIGHT
+            3: (-1, 0)   # UP
+        }
+        
+        # Get the last position to avoid backtracking
+        last_pos = self.last_positions.get(human, None)
+        
+        # Try directions in a random order
+        directions = list(range(4))
+        random.shuffle(directions)
+        
+        for action in directions:
+            dr, dc = moves[action]
+            new_pos = (cur_row + dr, cur_col + dc)
+            
+            # Check if position is valid
+            r, c = new_pos
+            if r < 0 or r >= grid_size[0] or c < 0 or c >= grid_size[1]:
+                continue  # Out of bounds
+            
+            # Don't move into shelf obstacles or backtrack
+            if grid[r, c] == 2 or new_pos == last_pos:
+                continue
+            
+            # Allow moving through agents as they'll be resolved in the conflict resolution phase
+            return action
+        
+        # If no valid move, return wait action
         return 6
 
 def get_random_empty_position(grid, grid_size, avoid_values=[1, 2, 3, 4, 5]):
