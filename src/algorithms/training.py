@@ -75,8 +75,18 @@ def setup_keyboard_listener():
     # Return the control dictionary that will be updated by the thread
     return control
 
-def initialize_agent(env, agent, debug_level, phase, sampling_mode):
-    """Initialize or update agent for training."""
+def initialize_agent(env, agent, debug_level, phase, sampling_mode, force_new_model=False):
+    """
+    Initialize or update agent for training.
+    
+    Args:
+        env: Environment to train in
+        agent: Existing agent or None to create new one
+        debug_level: Debug verbosity level
+        phase: Current training phase
+        sampling_mode: Exploration strategy
+        force_new_model: Whether to force creation of new model path and writer
+    """
     if agent is None:
         # Create new agent
         return QLAgent(env, debug_level=debug_level, use_tensorboard=True, phase=phase)
@@ -85,16 +95,18 @@ def initialize_agent(env, agent, debug_level, phase, sampling_mode):
     old_phase = agent.phase
     agent.env = env
     agent.phase = phase
-    agent.model_name = f"phase_{phase}_dqn_{time.strftime('%Y%m%d-%H%M%S')}.pth"
-    agent.model_path = os.path.join(get_model_path(), agent.model_name)
 
-    # Only reset settings if phase changed
-    if agent.phase != old_phase:
+    # Only generate new model name if forced or if phase changed
+    if force_new_model or agent.phase != old_phase:
+        agent.model_name = f"phase_{phase}_dqn_{time.strftime('%Y%m%d-%H%M%S')}.pth"
+        agent.model_path = os.path.join(get_model_path(), agent.model_name)
+        
         # Reset TensorBoard writer
-        agent.writer.close()
+        if hasattr(agent, 'writer') and agent.writer:
+            agent.writer.close()
         agent.writer = SummaryWriter(log_dir=f"runs/{agent.model_name}")
         
-        # Log hyperparameters 
+        # Log hyperparameters
         hp_dict = {
             'phase': agent.phase,
             'alpha': agent.alpha,
@@ -108,6 +120,9 @@ def initialize_agent(env, agent, debug_level, phase, sampling_mode):
             'update_freq': agent.update_freq,
             'tau': agent.tau,
             'frame_history': agent.frame_history,
+            'use_per': agent.use_per,
+            'use_softmax': agent.use_softmax,
+            'use_qmix': getattr(agent, 'use_qmix', False),
             'sampling_mode': sampling_mode
         }
         param_str = "\n".join([f"{k}: {v}" for k, v in hp_dict.items()])
@@ -129,8 +144,8 @@ def initialize_agent(env, agent, debug_level, phase, sampling_mode):
 
 def run_evaluation(agent, phase, episode, debug_level, max_steps, eval_episodes, eval_history):
     """Run benchmark evaluation of current agent."""
-    # Save current model for evaluation
-    temp_model_path = agent.model_path.replace('.pth', f'_temp_eval_{episode}.pth')
+    # Save current model for evaluation without modifying agent's model_path attribute
+    temp_model_path = os.path.join(get_model_path(), f"temp_eval_{phase}.pth")
     agent.save_model(temp_model_path)
     print(f"\nEvaluating model at episode {episode}...")
     
@@ -139,9 +154,16 @@ def run_evaluation(agent, phase, episode, debug_level, max_steps, eval_episodes,
         env_phase=phase,
         n_steps=max_steps,
         debug_level=debug_level,
-        model_path=temp_model_path,
+        model_path=temp_model_path,  # Use temporary path
         eval_episodes=eval_episodes
     )
+    
+    # Clean up temporary file after benchmarking
+    if os.path.exists(temp_model_path):
+        try:
+            os.remove(temp_model_path)
+        except Exception as e:
+            print(f"Warning: Could not remove temporary evaluation file {temp_model_path}: {e}")
     
     if not benchmark_results:
         return False, 0, eval_history, False
@@ -152,7 +174,7 @@ def run_evaluation(agent, phase, episode, debug_level, max_steps, eval_episodes,
     eval_history['avg_rl_tasks'].append(benchmark_results['avg_rl_tasks'])
     eval_history['avg_astar_tasks'].append(benchmark_results['avg_astar_tasks'])
     
-    # Log to TensorBoard
+    # Log to TensorBoard - using existing writer
     if hasattr(agent, 'writer'):
         agent.writer.add_scalar("Evaluation/A*_Tasks", benchmark_results['avg_astar_tasks'], episode)
         agent.writer.add_scalar("Evaluation/RL_Tasks", benchmark_results['avg_rl_tasks'], episode)
@@ -169,7 +191,7 @@ def run_evaluation(agent, phase, episode, debug_level, max_steps, eval_episodes,
         agent.writer.add_histogram("Evaluation/Ratio_Distribution", 
                                 np.array([r for r in benchmark_results['episode_ratios'] if r != float('inf')]), episode)
     
-    # Handle best model saving
+    # Handle best model saving - without changing model path
     improved = False
     current_performance = benchmark_results['avg_rl_tasks']
     
@@ -386,7 +408,7 @@ def train_DQN(env, agent=None, n_episodes=1000, max_steps=1000, debug_level=DEBU
         print(f"Using {num_threads} CPU threads for data loading.")
     
     # Initialize agent and keyboard controls
-    if not agent:
+    if agent is None:
         ql_agent = QLAgent(
             env, debug_level=debug_level, phase=phase, 
             use_tensorboard=True, use_qmix=use_qmix
@@ -684,6 +706,11 @@ def create_stage3_env():
 
 def initialize_multi_agent_networks(agent, new_env, source_agent_id="agent_0"):
     """Copy network architecture and weights from one agent to all others."""
+
+    if agent.use_parameter_sharing:
+        # No need to copy networks if using parameter sharing, all agents share the same network
+        return agent
+    
     # Extract network architecture parameters from source agent
     source_network = agent.q_networks[source_agent_id]
     source_state_dict = source_network.state_dict()
@@ -692,7 +719,7 @@ def initialize_multi_agent_networks(agent, new_env, source_agent_id="agent_0"):
     width = source_network.width
     frame_history = source_network.frame_history
     hidden_size = source_network.fc1.out_features // 2  # Divide by 2 since it uses hidden_size*2
-
+        
     # Initialize all new agent networks with the source knowledge
     for agent_id in new_env.agents:
         if agent_id != source_agent_id:
@@ -730,7 +757,7 @@ def train_stage(stage_num, stage_names, stage_env, agent, max_steps, save_every,
         agent.epsilon = 0.9
         
         # Update model name for this phase
-        agent.model_name = f"phase_{stage_num}_dqn_{time.strftime('%Y%m%d-%H%M%S')}.pth"
+        agent.model_name = f"phase_{stage_num}_dqn_{agent.start_time}.pth"
         agent.model_path = os.path.join(get_model_path(), agent.model_name)
         
         # Update TensorBoard writer for the new phase
@@ -889,7 +916,8 @@ def train_DQN_curriculum(target_env, n_episodes=1000, max_steps=1000, debug_leve
 
     # Save final model
     if agent is not None:
-        agent.save_model(model_path)
+        agent.save_model(f"dqn_{agent.start_time}_final.pth")
+        print(f"Final model saved as: dqn_{agent.start_time}_final.pth")
     
     # Print summary results
     print("\n=== CURRICULUM LEARNING COMPLETE ===")

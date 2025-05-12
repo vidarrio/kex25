@@ -3,7 +3,7 @@ from environment import env
 from algorithms import run_a_star, run_q_learning, train_DQN_curriculum, train_DQN, benchmark_environment
 import os
 
-CURRENT_VERSION = "v1.2.1"
+CURRENT_VERSION = "v1.2.3"
 
 # Construct path to the model directory
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -21,6 +21,9 @@ def get_env(env_name):
                         num_pickup_points=1, num_dropoff_points=1, render_mode="human")
 
     warehouse_env = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=6, n_humans=10, num_shelves=2048, num_pickup_points=3,
+                            num_dropoff_points=2, render_mode="human")
+    
+    test_env = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=10, n_humans=10, num_shelves=2048, num_pickup_points=3,
                             num_dropoff_points=2, render_mode="human")
     
     if env_name == "stage1":
@@ -41,7 +44,7 @@ def start_DQN_eval(model_path=None):
 
 def start_DQN_training():
     # Train DQN agent
-    train_DQN_curriculum(get_env("warehouse"), n_episodes=1000, max_steps=1000, save_every=100, model_path=model_path)
+    train_DQN_curriculum(get_env("warehouse"), n_episodes=1000, max_steps=1000, save_every=100)
 
 def test_a_star():
     run_a_star(get_env("warehouse"), n_steps=1000, debug_level=0)
@@ -88,9 +91,9 @@ def main(task, argv=None):
         benchmark_agents()
     elif task == "manual_benchmark":
         model = argv[0] if argv else None
-        phase = int(argv[1]) if len(argv) > 1 else None
+        phase = int(argv[1]) if len(argv) > 1 else 4
         if model and phase:
-            benchmark_environment(env_phase=phase, model_path=models_dir + "/" + model)
+            benchmark_environment(env_phase=phase, n_steps=1000, model_path=models_dir + "/" + model)
     else:
         raise ValueError("Invalid task. Choose 'a_star', 'dqn_train', 'dqn_eval', or 'benchmark'.")
 

@@ -1,14 +1,7 @@
 from collections import deque
 import heapq
-import numpy as np
-import time
 
-DEBUG_NONE = 0
-DEBUG_CRITICAL = 1
-DEBUG_INFO = 2
-DEBUG_VERBOSE = 3
-DEBUG_ALL = 4
-DEBUG_SPECIFIC = 5
+from .common import DEBUG_ALL, DEBUG_INFO, DEBUG_VERBOSE, DEBUG_CRITICAL, DEBUG_SPECIFIC
 
 class AStarAgent:
     """
@@ -439,7 +432,11 @@ class AStarAgent:
         
         # Get obstacle map for planning
         global_state, _ = self.env.get_global_state()
-        obstacle_map = global_state[1].copy()
+        # Reshape global_state back to its multi-channel grid form
+        channels = 8  # Global state channels
+        height, width = self.env.grid_size
+        reshaped_state = global_state.reshape(channels, height, width)
+        obstacle_map = reshaped_state[1].copy()
         
         # Try to connect to each candidate
         for target_idx, (target_r, target_c), _ in reconnect_candidates:
@@ -530,7 +527,7 @@ class AStarAgent:
             modified (bool): True if any paths were modified
         """
 
-        return False # Disable local conflict handling for now
+        # return False # Disable local conflict handling for now
         modified = False
 
         for agent, observation in observations.items():
@@ -575,18 +572,19 @@ class AStarAgent:
                         # Debug output
                         self.debug(DEBUG_VERBOSE, f"Agent {agent} current pos: {current_pos}, local obs: dynamic_obstacle={dynamic_obstacle}, static_obstacle={static_obstacle}, at {local_r},{local_c}, grid {next_r, next_c} value: {grid_value}")
                         
-                        # Skip collision detection for pickup/dropoff points that are goals
+                        # Get information about destination
                         is_pickup = (next_r, next_c) in self.env.pickup_points
                         is_dropoff = (next_r, next_c) in self.env.dropoff_points
                         is_goal = (next_r, next_c) == self.env.agent_goals[agent]
                         
-                        # Handle various obstacle scenarios
+                        # Handle various obstacle scenarios - ALWAYS handle collision if other agent or human detected
                         if other_agent or static_obstacle:
-                            # Handle non-human obstacles normally
-                            if not (is_pickup or is_dropoff):
-                                conflict_detected = True
-                                self._handle_conflict(agent, observation, action, current_pos, next_idx, "static")
-                                modified = True
+                            # Always handle collisions with other agents and static obstacles
+                            conflict_detected = True
+                            obstacle_type = "static" if static_obstacle else "agent"
+                            self._handle_conflict(agent, observation, action, current_pos, next_idx, obstacle_type)
+                            modified = True
+                            
                         elif dynamic_obstacle:
                             # Special handling for humans
                             conflict_detected = True
@@ -623,6 +621,10 @@ class AStarAgent:
                                     reconnection_success = self._attempt_path_reconnection(agent, alt_r, alt_c, next_idx)
                                     
                                     if not reconnection_success:
+                                        # Initialize the human_avoidance_replanning dict if it doesn't exist
+                                        if not hasattr(self, 'human_avoidance_replanning'):
+                                            self.human_avoidance_replanning = {}
+                                            
                                         # If we can't reconnect, force replanning after a short wait
                                         self.debug(DEBUG_INFO, f"Path reconnection failed for agent {agent}, will replan after a few steps")
                                         self.human_avoidance_replanning[agent] = 3  # Replan after 3 steps
@@ -637,7 +639,7 @@ class AStarAgent:
                                 # Human is not blocking a goal, handle normally with waiting
                                 self._handle_conflict(agent, observation, action, current_pos, next_idx, "dynamic")
                                 modified = True
-                    
+                
         # Check for agents that need replanning after human avoidance
         if hasattr(self, 'human_avoidance_replanning'):
             for agent in list(self.human_avoidance_replanning.keys()):
@@ -1028,7 +1030,7 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
                     a_star_agent.debug(DEBUG_INFO, f"{agent} has reached its goal!")
         
         # Render the environment
-        # env.render()
+        env.render()
         
         # Print info
         a_star_agent.debug(DEBUG_INFO, f"Rewards: {rewards}")

@@ -34,6 +34,11 @@ def run_benchmark_episode(seed, phase, steps, model_path):
                         num_pickup_points=3, num_dropoff_points=2, render_mode=None, seed=seed)
         env_dqn = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=6, n_humans=10, num_shelves=2048, 
                         num_pickup_points=3, num_dropoff_points=2, render_mode=None, seed=seed)
+    elif phase == 4:
+        env_a_star = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=10, n_humans=10, num_shelves=2048, 
+                        num_pickup_points=3, num_dropoff_points=2, render_mode=None, seed=seed)
+        env_dqn = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=10, n_humans=10, num_shelves=2048, 
+                        num_pickup_points=3, num_dropoff_points=2, render_mode=None, seed=seed)
     
     # Reset environments
     env_a_star.reset()
@@ -164,7 +169,7 @@ def run_q_learning(env, full_model_path, n_steps=1000, debug_level=DEBUG_NONE, s
     """
     
     # Initialize agent in evaluation mode
-    QL_agent = QLAgent(env, debug_level=debug_level)
+    QL_agent = QLAgent(env, debug_level=debug_level, use_tensorboard=False)
     QL_agent.epsilon = 0.05  # Small epsilon for minimal exploration during evaluation
     
     # Load the trained model if it exists

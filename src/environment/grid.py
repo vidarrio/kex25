@@ -1,25 +1,19 @@
 from collections import deque
-from pettingzoo.utils import wrappers
 from pettingzoo.utils import ParallelEnv
 import numpy as np
-import gymnasium
 from gymnasium import spaces
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
 import random
 import functools
-import os
-import sys
 from .utils import SimpleHumanPlanner, get_random_empty_position, assign_new_human_goal
 from matplotlib.widgets import Button
-from supersuit import frame_stack_v1
 
 class WarehouseEnv(ParallelEnv):
     metadata = {'render_modes': ['human', 'rgb_array'], 'name': 'warehouse_v0'}
 
     def __init__(self, grid_size=(20, 20), human_grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, 
                  num_pickup_points=3, num_dropoff_points=2, seed=None, env_name="default",
-                 observation_size=(5, 5), render_mode=None, use_frame_stack=True, n_frames=4):
+                 observation_size=(5, 5), render_mode=None, use_frame_stack=True, n_frames=4, use_reward_shifting=False):
         super().__init__()
 
         # Environment parameters
@@ -33,16 +27,17 @@ class WarehouseEnv(ParallelEnv):
         self.num_shelves = num_shelves
         self.num_pickup_points = num_pickup_points
         self.num_dropoff_points = num_dropoff_points
-        self.collision_penalty = -0.15
-        self.task_reward = 1
+        self.collision_penalty = -0.10
+        self.task_reward = 10
         self.step_cost = -0.1
-        self.progress_reward = 0.05
-        self.wait_penalty = -0.15
+        self.progress_reward = 0.5
+        self.wait_penalty = -0.2
         self.revisit_penalty = -0.02
         self.gamma = 0.99
         self.render_mode = render_mode
         self.use_frame_stack = use_frame_stack
         self.n_frames = n_frames
+        self.use_reward_shifting = use_reward_shifting
         self.seed = seed
 
         # Create list of possible agents
@@ -182,7 +177,7 @@ class WarehouseEnv(ParallelEnv):
         self.steps += 1
 
         # Initialize for active agents
-        rewards = {agent: self.step_cost for agent in self.agents} # base cost per step
+        rewards = {agent: 0 for agent in self.agents} 
 
         # Initialize for all possible agents
         terminations = {agent: False for agent in self.possible_agents}
@@ -439,7 +434,7 @@ class WarehouseEnv(ParallelEnv):
 
             # Set up the grid
             self.ax.set_xlim(-0.5, self.grid_size[1] - 0.5)
-            self.ax.set_ylim(-0.5, self.grid_size[0] - 0.5)
+            self.ax.set_ylim(self.grid_size[0] - 0.5, -0.5)
             self.ax.set_xticks(np.arange(-0.5, self.grid_size[1], 1), minor=True)
             self.ax.set_yticks(np.arange(-0.5, self.grid_size[0], 1), minor=True)
             self.ax.grid(which='minor', color='grey', linestyle='-', linewidth=0.5)
@@ -750,34 +745,42 @@ class WarehouseEnv(ParallelEnv):
                 obs[4, lr, lc] = 1 if (gr, gc) == self.agent_goals[agent] else 0
 
                 # Channel 6: Pickup points
-                obs[5, lr, lc] = 1 if (gr, gc) in self.pickup_points else 0
+                #obs[5, lr, lc] = 1 if (gr, gc) in self.pickup_points else 0
+
+                # Channel 6: Goal pickup points
+                if (gr, gc) in self.pickup_points and (gr, gc) == self.agent_goals[agent]:
+                    obs[5, lr, lc] = 1
 
                 # Channel 7: Dropoff points
-                obs[6, lr, lc] = 1 if (gr, gc) in self.dropoff_points else 0
+                # obs[6, lr, lc] = 1 if (gr, gc) in self.dropoff_points else 0
+
+                # Channel 7: Goal dropoff points
+                if (gr, gc) in self.dropoff_points and (gr, gc) == self.agent_goals[agent]:
+                    obs[6, lr, lc] = 1
 
         # Channel 8: Agent's carrying status
         obs[7, :, :] = 1 if self.agent_carrying[agent] else 0
 
         # Channel 9: Valid pickup/drop indicator
         if self.agent_carrying[agent]:
-            # If carrying, mark valid dropoff points
+            # If carrying, mark goal dropoffs as valid
             dropoff_idx = self.agent_item_types[agent]
             for i in range(-window_size, window_size + 1):
                 for j in range(-window_size, window_size + 1):
                     gr, gc = r + i, c + j
                     lr, lc = i + window_size, j + window_size
                     if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
-                        if (gr, gc) == self.dropoff_points[dropoff_idx]:
+                        if (gr, gc) == self.agent_goals[agent] and (gr, gc) == self.dropoff_points[dropoff_idx]:
                             obs[8, lr, lc] = 1
         else:
-            # If not carrying, mark all pickup points as valid
+            # If not carrying, mark goal pickup points as valid
             for i in range(-window_size, window_size + 1):
-                for j in range(-window_size, window_size + 1):
-                    gr, gc = r + i, c + j
-                    lr, lc = i + window_size, j + window_size
-                    if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
-                        if (gr, gc) in self.pickup_points:
-                            obs[8, lr, lc] = 1
+                    for j in range(-window_size, window_size + 1):
+                        gr, gc = r + i, c + j
+                        lr, lc = i + window_size, j + window_size
+                        if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
+                            if (gr, gc) == self.agent_goals[agent] and (gr, gc) in self.pickup_points:
+                                obs[8, lr, lc] = 1
 
         # Channel 10: Goal direction as normalized relative coordinates (0-1)
 
@@ -1089,6 +1092,10 @@ class WarehouseEnv(ParallelEnv):
 
         if not hasattr(self, 'min_dist_to_goal'):
             self.min_dist_to_goal = {agent: float('inf') for agent in self.agents}
+
+        # 0 Reward shift 
+        if self.use_reward_shifting:
+            rewards[agent] += abs(self.collision_penalty + self.step_cost + self.wait_penalty + self.revisit_penalty) 
         
         # 1 Step penalty (efficiency)
         rewards[agent] += self.step_cost
