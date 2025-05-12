@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+import json
 import numpy as np
 import torch
 import torch.nn as nn
@@ -5,11 +7,11 @@ import torch.nn.functional as F
 import random
 import os
 from collections import namedtuple, deque
-from subprocess import call
 import time
-from torch.cuda.amp import autocast
 import matplotlib.pyplot as plt  # add import for plotting near the other imports
-import json  # add this import near the other imports
+
+from environment.constants import ActionType
+from environment.grid import WarehouseEnv  # add this import near the other imports
 
 # Debug levels
 DEBUG_NONE = 0
@@ -89,7 +91,7 @@ class QNetwork(nn.Module):
         return self.fc3(x)
         
 class ReplayBuffer:
-    """Fixed-size buffer to store experience tuples."""
+    """Fixed-size buffer to store experience tuples with priorities."""
 
     def __init__(self, buffer_size, batch_size):
         """
@@ -99,46 +101,54 @@ class ReplayBuffer:
             buffer_size: Maximum size of the buffer.
             batch_size: Size of training batch.
         """
-
         self.memory = deque(maxlen=buffer_size)
+        self.priorities = deque(maxlen=buffer_size)
         self.batch_size = batch_size
 
     def add(self, state, action, reward, next_state, done):
         """
-        Add new experience to the buffer memory.
+        Add new experience to the buffer memory with initial priority.
         """
-
         e = Experience(state, action, reward, next_state, done)
-        
-        # Prioritize successful experiences
-        if reward > 10.0: # task completion
-            # Add experience multiple times
+        # New experiences get max priority so they are sampled at least once
+        initial_prio = max(self.priorities) if self.priorities else 1.0
+
+        # Prioritize task-completion experiences by inserting multiple times
+        if reward > 10.0:
             for _ in range(3):
                 self.memory.append(e)
+                self.priorities.append(initial_prio)
         else:
-            # Add experience once
             self.memory.append(e)
+            self.priorities.append(initial_prio)
 
     def sample(self):
         """
-        Randomly sample a batch of experiences from the buffer.
+        Sample a batch of experiences from the buffer using prioritized sampling.
         """
+        # Weighted sampling using Python's random.choices for speed
+        idxs = random.choices(
+            population=range(len(self.memory)),
+            weights=list(self.priorities),
+            k=self.batch_size
+        )
 
-        experiences = random.sample(self.memory, k=self.batch_size)
+        # Gather sampled experiences
+        experiences = [self.memory[i] for i in idxs]
 
         # Process all states together before transferring to GPU
-        states = np.stack([e.state for e in experiences])
-        actions = np.vstack([e.action for e in experiences])
-        rewards = np.vstack([e.reward for e in experiences])
+        states      = np.stack([e.state      for e in experiences])
+        actions     = np.vstack([e.action     for e in experiences])
+        rewards     = np.vstack([e.reward     for e in experiences])
         next_states = np.stack([e.next_state for e in experiences])
-        dones = np.vstack([e.done for e in experiences]).astype(np.uint8)
+        dones       = np.vstack([e.done       for e in experiences]).astype(np.uint8)
 
         # Single transfer to GPU
-        states = torch.FloatTensor(states).to(device)
-        actions = torch.LongTensor(actions).to(device)
-        rewards = torch.FloatTensor(rewards).to(device)
+        states      = torch.FloatTensor(states).to(device)
+        actions     = torch.LongTensor(actions).to(device)
+        rewards     = torch.FloatTensor(rewards).to(device)
         next_states = torch.FloatTensor(next_states).to(device)
-        dones = torch.FloatTensor(dones).to(device)
+        dones       = torch.FloatTensor(dones).to(device)
 
         return states, actions, rewards, next_states, dones
     
@@ -146,7 +156,6 @@ class ReplayBuffer:
         """
         Return the current size of the buffer.
         """
-
         return len(self.memory)
         
 class QLAgent:
@@ -154,12 +163,10 @@ class QLAgent:
     Q-learning agent for warehouse navigation.
     """
 
-
-
-    def __init__(self, env, debug_level=DEBUG_NONE,
+    def __init__(self, env: WarehouseEnv, debug_level=DEBUG_NONE,
                  alpha=0.00005, gamma=0.99, epsilon_start=1.0, epsilon_end=0.1,
-                 epsilon_decay=0.9985, hidden_size=64, buffer_size=1000000, batch_size=128,
-                 update_freq=8, tau=0.001):
+                 epsilon_decay=0.9965, hidden_size=64, buffer_size=20000, batch_size=128,
+                 update_freq=16, tau=0.001):
         """
         Initialize the Q-learning agent.
 
@@ -181,13 +188,11 @@ class QLAgent:
         self.env = env
         self.debug_level = debug_level
 
-        # Get observation shape from environment
-        observation_shape = env.observation_size
-        observation_channels = 10
-
-        # State and action dimentions
-        self.state_size = (observation_channels, *observation_shape)
-        self.action_size = 7 # 4 movement, 3 actions (pickup, dropoff, wait)
+        # Determine state and action dimensions from the environment
+        sample_agent = env.possible_agents[0]
+        obs_space = env.observation_space(sample_agent).shape  # e.g. (C, H, W)
+        self.state_size = obs_space
+        self.action_size = env.action_space(sample_agent).n
 
         # Shared Q-network and target network
         self.q_network = QNetwork(self.state_size, self.action_size, hidden_size).to(device)
@@ -212,10 +217,6 @@ class QLAgent:
 
         # Initilize step counter
         self.t_step = 0
-
-        # Tracking training progress
-        self.completed_tasks = []
-        self.episode_rewards = []
 
         # Add attribute to store loss values for the current episode
         self.episode_losses = []
@@ -336,8 +337,6 @@ class QLAgent:
                     actions[agent] = int(torch.argmax(action_values_batch[i:i+1]).item())
 
         return actions
-
-
         
     def update_epsilon(self):
         """
@@ -379,7 +378,7 @@ class QLAgent:
 
         # Only compute next_q_values if gamma > 0
         if self.gamma > 0:
-            # Get Q-values from target network
+            # Double-DQN: select next action with online network, evaluate with target network
             with torch.no_grad():
                 next_actions = self.q_network(next_states).argmax(1, keepdim=True)
                 next_q_values = self.target_network(next_states).gather(1, next_actions)
@@ -388,8 +387,8 @@ class QLAgent:
             # If gamma is 0, use rewards directly
             targets = rewards
 
-        # Compute loss and update weights
-        loss = F.mse_loss(q_values, targets)
+        # Use Huber (smooth L1) loss for robustness
+        loss = F.smooth_l1_loss(q_values, targets)
         # Append current loss to the episode_losses for plotting later
         self.episode_losses.append(loss.item())
 
@@ -422,7 +421,50 @@ def check_gpu_usage():
         print(f"Memory allocated: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
         print(f"Memory cached: {torch.cuda.memory_reserved(0) / 1e9:.2f} GB")
 
-def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, save_every=100, model_path=get_model_path(), load_path=None):
+
+@dataclass
+class EpisodeMetrics:
+    episode: int
+    num_agents: int
+    episode_time: float
+    epsilon: float
+    episode_loss: list[float]
+
+    robot_rewards: dict[str, float]
+    robot_completed_tasks: dict[str, int]
+    robot_colissions: dict[str, int]
+
+    @classmethod
+    def csv_header(cls) -> str:
+        """
+        Return CSV header for metrics.
+        """
+        return ",".join([
+            "Episode",
+            "Time",
+            "Epsilon",
+            "Avg_Loss",
+            "Total_Rewards",
+            "Total_Deliveries",
+            "Total_Collisions",
+        ])
+
+    def to_csv_row(self) -> str:
+        """
+        Convert metrics to a CSV row format.
+        """
+        return ",".join([
+            str(self.episode),
+            str(self.episode_time),
+            str(float(self.epsilon)),
+            str(float(np.mean(self.episode_loss) if self.episode_loss else 0)),
+            str(float(sum(self.robot_rewards.values()))),
+            str(int(sum(self.robot_completed_tasks.values()))),
+            str(int(sum(self.robot_colissions.values()))),
+        ])
+
+
+def train_DQN(env: WarehouseEnv, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, save_every=100, model_path=get_model_path(), load_path=None):
     """
     Train Q-learning agent in the warehouse environment.
     
@@ -456,156 +498,142 @@ def train_DQN(env, n_episodes=1000, max_steps=1000, debug_level=DEBUG_CRITICAL, 
     try:
         ql_agent.load_model(load_path)
         print(f"Loaded trained model from {load_path}")
-    except FileNotFoundError:
+    except (FileNotFoundError, AttributeError):
         print(f"Model file not found at {load_path}. Using untrained agent.")
 
-    # Track scores
-    scores = []
-    avg_losses = []  # list to store average loss per episode
-    avg_score = []
-    avg_deliveries = []  # list to store average deliveries per robot per episode
-    epsilons = []        # list to store epsilon value at end of each episode
-
-    # Add timing variables
-    total_env_time = 0
-    total_agent_time = 0
-    total_select_action_time = 0
-    total_step_time = 0
+    metrics: list[EpisodeMetrics] = []
     
+    terminations = {agent: False for agent in env.agents}
     # Training loop
     try:
         for episode in range(1, n_episodes + 1):
             episode_start = time.time()
-            
-            # Reset environment
-            env_reset_start = time.time()
             observations, _ = env.reset()
-            total_env_time += time.time() - env_reset_start
             ql_agent.episode_losses = []  # reset loss list for new episode
-            score = 0
+
+            robot_rewards = {agent: 0 for agent in env.agents}
 
             # Run episode
-            for step in range(max_steps):
-                # Time action selection
-                select_action_start = time.time()
+            for current_step in range(max_steps):
                 actions = ql_agent.select_action_batch(observations)
-                total_select_action_time += time.time() - select_action_start
-
-                # Time environment step
-                env_step_start = time.time()
-                next_observations, rewards, terminations, truncations, infos = env.step(actions)
-                total_env_time += time.time() - env_step_start
-                
-                # Time agent learning step
-                agent_step_start = time.time()
+                next_observations, rewards, _ = env.step(actions)
                 ql_agent.step(observations, actions, rewards, next_observations, terminations)
-                total_step_time += time.time() - agent_step_start
-                
+                     
                 # Update score and observations
-                score += sum(rewards.values())
                 observations = next_observations
                 
-                # Render environment
-                # if episode > 600:
-                #     env.render()
-                    
-                
-                    
-                
+                for agent in env.agents:
+                    robot_rewards[agent] += rewards[agent]
 
                 # Debug info
-                ql_agent.debug(DEBUG_INFO, f"Episode {episode}, Step {step}")
+                ql_agent.debug(DEBUG_INFO, f"Episode {episode}, Step {current_step}")
                 ql_agent.debug(DEBUG_INFO, f"Actions: {actions}")
                 ql_agent.debug(DEBUG_INFO, f"Rewards: {rewards}")
                 ql_agent.debug(DEBUG_INFO, f"Completed tasks: {env.completed_tasks}")
-                ql_agent.debug(DEBUG_INFO, f"Score: {score}")
                 
-                # Check if episode is done
-                if all(terminations.values() or all(truncations.values())):
-                    break
+            episode_stop = time.time()
 
             # Update epsilon for exploration
             ql_agent.update_epsilon()
-            # Record average deliveries and epsilon after this episode
-            avg_deliveries.append(sum(env.completed_tasks.values()) / len(env.agents))
-            epsilons.append(ql_agent.epsilon)
 
-            # Save score
-            scores.append(score)
-            
-            avg_score.append(score)
-
-            # Track performance metrics
-            ql_agent.episode_rewards.append(score)
-            ql_agent.completed_tasks.append(env.completed_tasks)
-
+            episode_metrics = EpisodeMetrics(
+                episode=episode,
+                num_agents=len(env.agents),
+                episode_time=episode_stop - episode_start,
+                epsilon=ql_agent.epsilon,
+                episode_loss=ql_agent.episode_losses,
+                robot_rewards=robot_rewards,
+                robot_completed_tasks=env.completed_tasks,
+                robot_colissions=env.collisions,
+            )
+        
             # Compute average loss for the episode (if any loss was recorded)
-            if ql_agent.episode_losses:
-                episode_avg_loss = np.mean(ql_agent.episode_losses)
-                avg_losses.append(episode_avg_loss)
-                print(f"Episode {episode} average loss: {episode_avg_loss:.4f}")
-            else:
-                avg_losses.append(0)
-                print(f"Episode {episode} average loss: 0.0000")
+            loss_number = "0.0000"
+            if episode_metrics.episode_loss:
+                episode_avg_loss = np.mean(episode_metrics.episode_loss)
+                loss_number =  f"{episode_avg_loss:.4f}"
+            print(
+                f"Episode {episode}: {episode_stop - episode_start:.2f}s\t"
+                f"avg-loss: {loss_number}\teps: {ql_agent.epsilon:.4f}\t"
+                f"tot-rewards: {sum(episode_metrics.robot_rewards.values()):.2f}\t"
+                f"tot-deliveries: {sum(episode_metrics.robot_completed_tasks.values())}\t"
+            )
                 
-            # Log episode results
-            ql_agent.debug(DEBUG_CRITICAL, f"Episode {episode}/{n_episodes}, Score: {score}, Completed tasks: {env.completed_tasks}, Epsilon: {ql_agent.epsilon:.4f}")
-
             # Save model periodically
             if episode % save_every == 0:
                 ql_agent.save_model(model_path)
+
+            # save graphs every 100 episodes
+            if episode % 50 == 0:
+                print_graph(metrics, "runtime_model")
+
+            metrics.append(episode_metrics)
                 
-            # Print timing info every 10 episodes
-            if episode % 10 == 0:
-                print(f"\nTiming breakdown (avg per episode):")
-                print(f"  Environment time: {total_env_time/episode:.4f}s")
-                print(f"  Action selection time: {total_select_action_time/episode:.4f}s")
-                print(f"  Agent learning time: {total_step_time/episode:.4f}s")
-                print(f"  Episode duration: {(time.time() - episode_start):.4f}s\n")
+    except KeyboardInterrupt as e:
+        print(f"Training interrupted: {e}")
+
     except Exception as e:
-        print(e)
-        pass
+        print(f"An error occurred during training: {e}")
+        raise e
+    
     finally:
         # Save final model
         ql_agent.save_model(model_path)
         
         # Save training metrics (average losses and scores) to a JSON file
-        metrics = {
-            "avg_losses": avg_losses,
-            "avg_score": avg_score,
-            "avg_deliveries": avg_deliveries,
-            "epsilons": epsilons
-        }
         current_time = time.strftime("%Y%m%d-%H%M%S")
-        metrics_file = f'{model_path}_training_metrics__{current_time}.json'
-        with open(metrics_file, "w") as f:
-            json.dump(metrics, f)
-        print(f"Training metrics saved to {metrics_file}")
+        metrics_file = f'{model_path}_training_metrics__{current_time}.csv'
         
-        # Plot loss, score, deliveries, and epsilon over episodes
-        plt.figure(figsize=(10, 12))
-        plt.subplot(4, 1, 1)
-        plt.plot(avg_losses)
-        plt.title("Average Q Loss per Episode")
-        plt.subplot(4, 1, 2)
-        plt.plot(avg_score)
-        plt.title("Average Score per Episode")
-        plt.subplot(4, 1, 3)
-        plt.plot(avg_deliveries)
-        plt.title("Average Deliveries per Robot per Episode")
-        plt.subplot(4, 1, 4)
-        plt.plot(epsilons)
-        plt.title("Epsilon Value per Episode")
-        plt.tight_layout()
-        plot_file = f'{model_path}_training_metrics__{current_time}.png'
-        plt.savefig(plot_file)
-        plt.close()
-        print(f"Training plots saved to {plot_file}")
+        with open(metrics_file, "w") as f:
+            f.write(EpisodeMetrics.csv_header() + "\n")
+            for metric in metrics:
+                f.write(f"{metric.to_csv_row()}\n")
+        print(f"Training metrics saved to {metrics_file}")
+
+        try:
+            with open(f'{model_path}_training_metadata_{current_time}.json', "w") as f:
+                metadata = {
+                    "reward_table": env.reward_table.__dict__,
+                }
+                json.dump(metadata, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print(f"Error saving training metadata: {e}")
+
+        print_graph(metrics, model_path)
 
         # Return trained agent
         return ql_agent
+    
 
-def run_q_learning(env, model_path=get_model_path(), n_steps=1000, debug_level=DEBUG_NONE):
+def print_graph(metrics: list[EpisodeMetrics], name: str):
+    current_time = time.strftime("%Y%m%d-%H%M%S")
+    
+    avg_losses = [np.mean(m.episode_loss) if m.episode_loss else None for m in metrics]
+    avg_score=[np.mean(list(m.robot_rewards.values())) for m in metrics]
+    avg_deliveries_per_robot_per_episode=[np.mean(list(m.robot_completed_tasks.values())) for m in metrics]
+    epsilons = [m.epsilon for m in metrics]
+
+    # Plot loss, score, deliveries, and epsilon over episodes
+    plt.figure(figsize=(10, 12))
+    plt.subplot(4, 1, 1)
+    plt.plot(avg_losses)
+    plt.title("Average Q Loss per Episode")
+    plt.subplot(4, 1, 2)
+    plt.plot(avg_score)
+    plt.title("Average Score per Episode")
+    plt.subplot(4, 1, 3)
+    plt.plot(avg_deliveries_per_robot_per_episode)
+    plt.title("Average Deliveries per Robot per Episode")
+    plt.subplot(4, 1, 4)
+    plt.plot(epsilons)
+    plt.title("Epsilon Value per Episode")
+    plt.tight_layout()
+    plot_file = f'{name}_metrics__{current_time}.png'
+    plt.savefig(plot_file)
+    plt.close()
+    print(f"Training plots saved to {plot_file}")
+
+def run_q_learning(env: WarehouseEnv, model_path=get_model_path(), n_steps=1000, debug_level=DEBUG_NONE):
     """
     Run trained Q-learning agent in the warehouse environment.
     
@@ -638,19 +666,20 @@ def run_q_learning(env, model_path=get_model_path(), n_steps=1000, debug_level=D
             actions[agent] = QL_agent.select_action(state, eval_mode=True)
 
         # Take actions in the environment
-        observations, rewards, terminations, truncations, infos = env.step(actions)
+        observations, rewards, _ = env.step(actions)
 
         # Render the environment
-        env.render()
+        WarehouseEnv.render(env)
+
+        agent_coordinates = env.agent_positions
 
         # Debug info
         print(f"Step {step}")
-        print(f"Actions: {actions}")
+        print(f"Actions: {[ActionType(action).name for action in list(actions.values())]}")
+        print(f"Coordinates: {[position for position in agent_coordinates.values()]}")
         print(f"Rewards: {rewards}")
         print(f"Completed tasks: {env.completed_tasks}")
 
-        if all(terminations.values()) or all(truncations.values()):
-            break
 
     # Close the environment
     env.close()

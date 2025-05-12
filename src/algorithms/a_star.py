@@ -728,7 +728,7 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
         actions = a_star_agent.get_actions()
         
         # Step the environment
-        observations, rewards, terminations, truncations, infos = env.step(actions)
+        observations, rewards, _ = env.step(actions)
 
         # Update cumulative rewards
         for agent in env.agents:
@@ -769,9 +769,7 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
             a_star_agent.debug(DEBUG_CRITICAL, "\nReplanning paths...")
             a_star_agent.plan_all_paths()
             
-        # Break if all agents are done
-        if terminations["__all__"]:
-            break
+       
     
     
     

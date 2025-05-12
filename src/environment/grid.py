@@ -1,654 +1,733 @@
-from pettingzoo.utils import wrappers
+from typing import TypeVar
 from pettingzoo.utils import ParallelEnv
 import numpy as np
-import gymnasium
 from gymnasium import spaces
 import matplotlib.pyplot as plt
-from matplotlib.colors import ListedColormap
-import random
-import functools
-import os
-import sys
-from .utils import SimpleHumanPlanner, get_random_empty_position, assign_new_human_goal
-from matplotlib.widgets import Button
-# Oscillation detection
+import random 
 from collections import deque
 
-class WarehouseEnv(ParallelEnv):
+from environment.constants import ActionType, CellType, Reward
+
+from .utils import SimpleHumanPlanner, get_random_empty_position, assign_new_human_goal
+from matplotlib.widgets import Button
+
+OSCILLATION_THRESHOLD = 4
+
+AgentID = TypeVar("AgentID", bound=str)
+ObsType = TypeVar("ObsType", bound=list[list[int]])
+
+
+def is_within_bounds(position: tuple[int, int], grid_size: tuple[int, int]) -> bool:
+    """
+    Check if the position is within the grid boundaries
+    """
+    return (0 <= position[0] < grid_size[0]) and (0 <= position[1] < grid_size[1])
+
+def is_collission(position: tuple[int, int], grid: np.ndarray) -> bool:
+    """
+    Check if the position collides with an obstacle (shelf or human)
+    """
+    # print(f"Checking collision at {position} with value {grid[position]}")
+    return grid[position] in [CellType.AGENT.value, CellType.SHELF.value, CellType.DYNAMIC_OBSTACLE.value]  # 1=agent, 2=shelf, 3=dynamic obstacle
+
+def move_position(position: tuple[int, int], action: ActionType) -> tuple[int, int]:
+    """
+    Move the position based on the action
+    """
+    trans = action.get_transpose()
+    return position[0] + trans[0], position[1] + trans[1]
+    
+
+class WarehouseEnv(ParallelEnv[str, list[list[int]], int]):
     metadata = {'render_modes': ['human', 'rgb_array'], 'name': 'warehouse_v0'}
 
-    def __init__(self, grid_size=(20, 20), human_grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, 
-                 num_pickup_points=3, num_dropoff_points=2, collision_penalty=-5, task_reward=50, step_cost=-2,
-                 observation_size=(5, 5), render_mode=None):
-        super().__init__()
+    reward_table: Reward = Reward(
+        step_penalty=-1.0,
+        correct_direction_reward=0.1,
+        collision_penalty=-2.0,
+        wrong_pickup_penalty=-2.0,
+        wrong_dropoff_penalty=-2.0,
+        oscillation_penalty = -2.0,
+        task_reward=20.0
+    )
 
-        # Environment parameters
+    def __init__(
+            self,
+            grid_size=(20, 20),
+            human_grid_size=(20, 20),
+            n_agents=2,
+            n_humans=1,
+            num_shelves=30, 
+            num_pickup_points=2,
+            num_dropoff_points=2,
+            observation_size=(5, 5),
+            render_mode=None,
+            seed=None,
+        ):
+        
+        super().__init__()
+        self.seed = seed
+
+        # Size of the whole grid
         self.grid_size = grid_size
-        self.human_grid_size = human_grid_size
         self.observation_size = observation_size
         self.n_agents = n_agents
-        self.n_humans = n_humans
         self.num_shelves = num_shelves
         self.num_pickup_points = num_pickup_points
         self.num_dropoff_points = num_dropoff_points
-        self.collision_penalty = collision_penalty
-        self.task_reward = task_reward
-        self.step_cost = step_cost
-        self.render_mode = render_mode
-        
-        self.wrong_pickup_penalty = -15
-        self.step_closer_reward = 1
-        self.shaping_gamma = 0.99  # discount factor for potential-based shaping
-        self.wrong_dropoff_penalty = -15
 
-        # Oscillation detection: track recent positions per agent
-        self.oscillation_penalty = -5  # heavy penalty when bouncing between two cells
-        self.oscillation_window = 2     # history length to detect A->B->A->B->A->B
-        self.position_history = {agent: deque(maxlen=self.oscillation_window) for agent in []}  # will init in reset
-        # Discourage invalid actions when standing still
-        self.invalid_action_penalty = -20
-
-        self.pickup_points = []
-
-
-        # Create list of possible agents
         self.possible_agents = ["agent_" + str(i) for i in range(self.n_agents)]
-
-        # Hold every agents previous position
-        self.previous_positions = {agent: None for agent in self.possible_agents}
         
-        # Create list of possible humans
+        # Size of the human area, with origon at the top left corner (?)
+        self.human_grid_size = human_grid_size
+        self.n_humans = n_humans
+        self.human_planner = SimpleHumanPlanner()
         self.possible_humans = ["human_" + str(i) for i in range(self.n_humans)]
         
-        # Create a SimpleHumanPlanner to handle human actions
-        self.human_planner = SimpleHumanPlanner()
+        self.render_mode = render_mode
 
-        # Initialize grid and agent data
-        self.reset()
-
-    # @functools.lru_cache(maxsize=None)
-    def action_space(self, agent):
-        """
-        Return the action space for a specific agent
-        The action space is discrete with the following actions:
-        0: Move Left (decrease column)
-        1: Move Down (increase row)
-        2: Move Right (increase column)
-        3: Move Up (decrease row)
-        4: Pickup Item
-        5: Drop Item
-        6: Wait
-        """
-        return spaces.Discrete(7)
-
-    # @functools.lru_cache(maxsize=None)
-    def observation_space(self, agent):
-        """
-        Return the observation space for a specific agent
-        The observation is a 9-channel grid of size (5, 5) around the agent
-        with the following channels:
-        1. Agent's position (1 at agent's position, 0 elsewhere)
-        2. Other agents' positions (1 at other agents' positions, 0 elsewhere)
-        3. Shelves' positions (1 at shelves' positions, 0 elsewhere)
-        4. Dynamic obstacles' positions (1 at dynamic obstacles' positions, 0 elsewhere)
-        5. Current goal position (1 at goal position, 0 elsewhere)
-        6. Pickup points' positions (1 at pickup points' positions, 0 elsewhere)
-        7. Dropoff points' positions (1 at dropoff points' positions, 0 elsewhere)
-        8. Agent's carrying status (1 if agent is carrying, 0 otherwise)
-        9. Valid pickup/drop indicator (1 if agent is at a valid pickup/drop point, 0 otherwise)
-        """
-
-        obs_shape = (10,) + self.local_observation_size
-        return spaces.Box(low=0, high=1, shape=obs_shape, dtype=np.float32)
-
-    def reset(self, seed=None, options=None):
+        self.reset(seed=self.seed, options=None)
+    
+    def reset(self, seed=None, options=None) -> tuple[dict[AgentID, ObsType], dict[AgentID, dict]]:
         if seed is not None:
             np.random.seed(seed)
             random.seed(seed)
 
-        # Set active agents
+        # Set active agents and humans
         self.agents = self.possible_agents.copy()
-        
-        # Set active humans
         self.humans = self.possible_humans.copy()
 
-        # Initialize local observation size
-        self.local_observation_size = (5, 5) # 5x5 grid around the agent
-        
         # Initialize grid: 0=empty, 1=agent, 2=shelf, 3=dynamic obstacle, 4=pickup point, 5=dropoff point
         self.grid = np.zeros(self.grid_size, dtype=np.int8)
+        self.grid_points = np.zeros(self.grid_size, dtype=np.int8)
 
         # Place shelves in a warehouse-like layout (aisles)
         self._place_shelves()
 
         # Place dropoff points (e.g. shipping area)
         self._place_dropoff_points()
+        self.pickup_points = []
 
         # Initialize agents at random positions
         self.agent_positions = {}
+        self.agent_prev_positions = {}
         self.agent_carrying = {agent: False for agent in self.agents}
         self.agent_goals = {}
         self.agent_item_types = {agent: None for agent in self.agents}
 
-        # Initialize agent positions
-        for agent in self.agents:
-            pos = get_random_empty_position(grid=self.grid, grid_size=self.grid_size)
-            self.agent_positions[agent] = pos
-            self.grid[pos] = 1
+        self._place_agents_randomly()
+        self._assign_pickup_point_to_agents()
 
-        # Place exactly one pickup point per agent
-        self.pickup_points = self._place_random_points(self.n_agents, avoid_values=[1, 2, 3, 4, 5])
-        for pos in self.pickup_points:
-            self.grid[pos] = 4
-
-        # Assign each agent a unique pickup point
-        for agent, pos in zip(self.agents, self.pickup_points):
-            self.agent_goals[agent] = pos
-            
         # Initialize humans at random positions
         self.human_positions = {}
         self.human_goals = {}
-
-        for human in self.humans:
-            # Find empty position
-            pos = get_random_empty_position(grid=self.grid, grid_size=self.human_grid_size)
-            self.human_positions[human] = pos
-            self.grid[pos] = 3
-
-            # Assign initial goal (pickup point)
-            assign_new_human_goal(human, self.human_goals, self.grid, self.human_grid_size)
+        
+        self._place_humans_randomly()
             
         # Metrics tracking
         self.steps = 0
         self.completed_tasks = {agent: 0 for agent in self.agents}
         self.collisions = {agent: 0 for agent in self.agents}
         self.total_distance = {agent: 0 for agent in self.agents}
-
-        # Initialize position history for active agents
-        from collections import deque
-        self.position_history = {agent: deque(maxlen=self.oscillation_window) for agent in self.agents}
+        
+        # track the last OSCILLATION_THRESHOLD+1 positions of each agent
+        self.agent_position_histories = {
+            agent: deque(maxlen = OSCILLATION_THRESHOLD + 1)
+            for agent in self.agents
+        }
 
         # Create observations
-        observations = {agent: self._get_observation(agent) for agent in self.agents}
+        observation_spaces = {
+            agent: self.observation_space(agent) for agent in self.possible_agents
+        }
+        info = {agent: {} for agent in self.agents}
+        return observation_spaces, info
 
-        # Create info dict for additional data
-        info = {agent: {
-            "position": self.agent_positions[agent],
-            "goal": self.agent_goals[agent],
-            "carrying": self.agent_carrying[agent],
-        } for agent in self.agents}
+    def _place_agents_randomly(self):
+        for agent in self.agents:
+            # Find empty position
+            pos = get_random_empty_position(grid=self.grid, grid_size=self.grid_size)
+            self.agent_positions[agent] = pos
+            self.agent_prev_positions[agent] = pos
+            self.grid[pos] = CellType.AGENT.value
 
-        return observations, info
+    def _assign_pickup_point_to_agents(self):
+        for agent in self.agents:
+            # Assign a new pickup point
+            pick_point = self.create_pickup_point()
+            self.agent_goals[agent] = pick_point
+
+    def _place_humans_randomly(self):
+        for human in self.humans:
+            # Find empty position
+            pos = get_random_empty_position(grid=self.grid, grid_size=self.human_grid_size)
+            self.human_positions[human] = pos
+            self.grid[pos] = CellType.DYNAMIC_OBSTACLE.value
+
+            # Assign initial goal (pickup point)
+            assign_new_human_goal(human, self.human_goals, self.grid, self.human_grid_size)
+
+    def _place_shelves(self):
+        """
+        Place shelves in a warehouse-like layout with proper aisles
+        - Shelf blocks are 2 wide, 4 long
+        - Vertical aisles are 2 cells wide
+        - Perimeter has 2-cell wide clearance
+        - Shelf count respects self.num_shelves
+        """
+        # First clear grid
+        self.grid[:, :] = 0
+        
+        # Parameters for shelf layout
+        shelf_width = 2       # Width of each shelf block (vertical size)
+        shelf_length = 4      # Length of each shelf block (horizontal size)
+        aisle_width = 2       # Width of vertical aisles between shelf blocks
+        perimeter_width = 2   # Empty space around the perimeter
+        
+        # Calculate usable area (excluding perimeter)
+        usable_height = self.grid_size[0] - 2 * perimeter_width
+        usable_width = self.grid_size[1] - 2 * perimeter_width
+        
+        # Calculate spacing
+        h_spacing = shelf_width + aisle_width    # Vertical spacing between shelf blocks
+        w_spacing = shelf_length + aisle_width   # Horizontal spacing between shelf blocks
+        
+        # Calculate maximum number of shelf blocks
+        num_row_blocks = (usable_height + aisle_width) // h_spacing  # +aisle_width because we don't need an aisle after the last row
+        num_col_blocks = (usable_width + aisle_width) // w_spacing   # +aisle_width because we don't need an aisle after the last column
+        
+        # Calculate total number of shelf cells available
+        total_shelf_cells = num_row_blocks * num_col_blocks * shelf_width * shelf_length
+        
+        # Limit by specified number
+        shelf_target = min(self.num_shelves, total_shelf_cells)
+        shelf_cells_placed = 0
+        
+        # Place shelves
+        for row_block in range(num_row_blocks):
+            if shelf_cells_placed >= shelf_target:
+                break
+                
+            for col_block in range(num_col_blocks):
+                if shelf_cells_placed >= shelf_target:
+                    break
+                    
+                # Calculate the top-left corner of this shelf block
+                start_row = perimeter_width + row_block * h_spacing
+                start_col = perimeter_width + col_block * w_spacing
+                
+                # Place the shelf cells for this block
+                for i in range(shelf_width):
+                    if start_row + i >= self.grid_size[0]:
+                        continue
+                        
+                    for j in range(shelf_length):
+                        if start_col + j >= self.grid_size[1]:
+                            continue
+                            
+                        if shelf_cells_placed < shelf_target:
+                            self.grid[start_row + i, start_col + j] = 2  # Mark as shelf
+                            shelf_cells_placed += 1
+        
+        # Ensure all aisles are clear
+        # Vertical aisles
+        for col_block in range(num_col_blocks + 1):
+            aisle_col = perimeter_width + col_block * w_spacing - aisle_width
+            if col_block > 0:  # Only clear aisles between shelf blocks
+                for r in range(perimeter_width, self.grid_size[0] - perimeter_width):
+                    for c in range(aisle_width):
+                        if 0 <= aisle_col + c < self.grid_size[1]:
+                            self.grid[r, aisle_col + c] = 0  # Clear aisle
+        
+        # Horizontal aisles
+        for row_block in range(num_row_blocks + 1):
+            aisle_row = perimeter_width + row_block * h_spacing - aisle_width
+            if row_block > 0:  # Only clear aisles between shelf blocks
+                for c in range(perimeter_width, self.grid_size[1] - perimeter_width):
+                    for r in range(aisle_width):
+                        if 0 <= aisle_row + r < self.grid_size[0]:
+                            self.grid[aisle_row + r, c] = 0  # Clear aisle
+        
+        # Ensure perimeter is clear
+        for r in range(self.grid_size[0]):
+            for c in range(self.grid_size[1]):
+                if r < perimeter_width or r >= self.grid_size[0] - perimeter_width or \
+                   c < perimeter_width or c >= self.grid_size[1] - perimeter_width:
+                    self.grid[r, c] = 0  # Clear perimeter
+
+    def _place_dropoff_points(self):
+        """
+        Hardcode dropoff points in the corners of the grid.
+        """
+        # Corners of the grid
+        corners = [
+            (0, 0),  # Top-left corner
+            (0, self.grid_size[1] - 1),  # Top-right corner
+            (self.grid_size[0] - 1, 0),  # Bottom-left corner
+            (self.grid_size[0] - 1, self.grid_size[1] - 1)  # Bottom-right corner
+        ]
+        # Middle point of the grid
+        # Middle points of the edges
+        middle_edges = [
+            (0, self.grid_size[1] // 2),  # Middle of the bottom edge
+            (self.grid_size[0] - 1, self.grid_size[1] // 2),  # Middle of the top edge
+            (self.grid_size[0] // 2, 0),  # Middle of the left edge
+            (self.grid_size[0] // 2, self.grid_size[1] - 1)  # Middle of the right edge
+        ]
+        all_dropoff_points = corners + middle_edges
+        
+        self.dropoff_points = all_dropoff_points[:self.num_dropoff_points]
+        for pos in self.dropoff_points:
+            self.grid_points[pos] = CellType.DROPOFF_POINT.value
     
     def step(self, actions):
         self.steps += 1
 
-        # Initialize for active agents
-        rewards = {agent: self.step_cost for agent in self.agents} # base cost per step
-
-        # Initialize for all possible agents
-        terminations = {agent: False for agent in self.possible_agents}
-        truncations = {agent: False for agent in self.possible_agents}
-        
-        # Initialize for all possible humans
-        human_terminations = {human: False for human in self.possible_humans}
-        human_truncations = {human: False for human in self.possible_humans}
-
-        # Mark agents not in active list as terminated
-        for agent in self.possible_agents:
-            if agent not in self.agents:
-                terminations[agent] = True
-                
-        # Mark humans not in active list as terminated
-        for human in self.possible_humans:
-            if human not in self.humans:
-                human_terminations[human] = True
-
-        # Process agents and humans in a random order to avoid bias
-        agents_order = list(self.agents)
-        humans_order = list(self.humans)
-        random.shuffle(agents_order)
-        random.shuffle(humans_order)
-
-        # Process humans first
-
-        # Get actions for humans
-        human_actions = self.human_planner.get_actions(humans=self.humans, human_positions=self.human_positions,
-                                                    human_goals=self.human_goals, grid=self.grid, grid_size=self.human_grid_size)
-        # First pass: compute new positions for humans
-        humans_new_positions = {}
-        for human in humans_order:
-            human_action = human_actions[human]
-            current_pos = self.human_positions[human]
-            new_pos = current_pos # Default: stay in place
-
-            # Execute movement actions (0-3)
-            if human_action < 4: # Movement actions
-                # Compute new position
-                delta_row, delta_col = [(0, -1), (1, 0), (0, 1), (-1, 0)][human_action]
-                new_row = current_pos[0] + delta_row
-                new_col = current_pos[1] + delta_col
-
-                # Check boundaries and obstacles
-                if (0 <= new_row < self.grid_size[0] and 
-                    0 <= new_col < self.grid_size[1] and
-                    self.grid[new_row, new_col] not in [1, 2]): # Not an agent or shelf
-                        new_pos = (new_row, new_col)
-            
-            # Store intended position
-            humans_new_positions[human] = new_pos
-
-        # Second pass: Resolve conflicts
-
-        # Current positions of all agents and humans
-        current_positions = {agent: self.agent_positions[agent] for agent in self.agents}
-        human_current_positions = {human: self.human_positions[human] for human in self.humans}
-
-        human_reserved_positions = {}
-
-        # Resolve human conflicts
-        final_human_positions, human_collisions, human_reserved_positions = second_pass(
-            humans_order,
-            human_current_positions,
-            humans_new_positions,
-            human_actions,
-            self.humans,
-            human_reserved_positions,
-            allow_overlap=True
-        )
-
-        # Third pass: Update all human positions
-        for human in self.humans:
-            current_pos = self.human_positions[human]
-            new_pos = final_human_positions[human]
-
-            if current_pos != new_pos:
-                # Clear old position in grid
-                self.grid[current_pos] = 0
-                # Update human position
-                self.human_positions[human] = new_pos
-                # Mark new position in grid
-                self.grid[new_pos] = 3  # Human
-
-        # Process agents
-
-        # First pass: compute new positions
-        new_positions = {}
-        for agent in agents_order:
-            action = actions[agent]
-            current_pos = self.agent_positions[agent]
-            new_pos = current_pos # Default: stay in place
-
-            # Execute movement actions (0-3)
-            if action < 4: # Movement actions
-                # Compute new position
-                delta_row, delta_col = [(0, -1), (1, 0), (0, 1), (-1, 0)][action]  # Left, Down, Right, Up
-                new_row = current_pos[0] + delta_row
-                new_col = current_pos[1] + delta_col
-
-                # Check boundaries and obstacles
-                if (0 <= new_row < self.grid_size[0] and 
-                    0 <= new_col < self.grid_size[1] and
-                    self.grid[new_row, new_col] not in [2, 3]): # Not a shelf or human
-                        new_pos = (new_row, new_col)
-                        self.total_distance[agent] += 0.3
-            
-            # Store intended position
-            new_positions[agent] = new_pos
-        
-        
-        
-        # Second pass: Resolve conflicts
-        reserved_positions = {}
-        # Resolve conflicts
-        final_positions, collision_agents, reserved_positions = second_pass(
-            agents_order, 
-            current_positions, 
-            new_positions, 
-            actions, 
-            self.agents,
-            reserved_positions,
-            allow_overlap=False
-        )
-        
-        # Third pass: Update all positions
-        for agent in self.agents:
-            current_pos = self.agent_positions[agent]
-            new_pos = final_positions[agent]
-
-            if current_pos != new_pos:
-                # Clear old position in grid
-                self.grid[current_pos] = 0
-                # Update agent position
-                self.agent_positions[agent] = new_pos
-                # Mark new position in grid
-                self.grid[new_pos] = 1
-
-            # Apply collision penalties
-            if agent in collision_agents:
-                rewards[agent] += self.collision_penalty
-                self.collisions[agent] += 1
-
-        # Fourth pass: Handle pickup/dropoff/wait actions
-        for agent in self.agents:
-            action = actions[agent]
-            current_pos = self.agent_positions[agent]
-            self._fourth_pass(agent, action, current_pos, rewards)
-
-        # Oscillation penalty: exponential based on sustained A<->B oscillations
-        for agent in self.agents:
-            # Update position history
-            self.position_history[agent].append(self.agent_positions[agent])
-            hist = self.position_history[agent]
-            # Detect basic 2-step oscillation pattern
-            if len(hist) >= 4 and hist[-1] == hist[-3] and hist[-2] == hist[-4]:
-                # Determine number of full oscillation pairs: for hist lengths 4,6...
-                num_pairs = len(hist) // 2 - 1  # hist 4->1, 6->2, etc.
-                # Exponential penalty multiplier
-                multiplier = 2 ** num_pairs
-                penalty = self.oscillation_penalty * multiplier
-                rewards[agent] += penalty
-
-        # Check for termination criteria (e.g. max steps etc.)
-        # In a warehouse setting, we might not have a natural termination point
-        # so we'll consider the episode ongoing until explicitly stopped
-        # Terminations are natural endings (e.g. all agents have completed their tasks)
-        # Truncations are artificial endings (e.g. max steps reached)
-        terminations["__all__"] = False
-        truncations["__all__"] = False
-
-        # Update previous positions for all agents
-        for agent in self.agents:
-            self.previous_positions[agent] = self.agent_positions[agent]
+        self._step_humans()
+        step_rewards = self._step_agents(actions)
 
         # Create observations
-        observations = {agent: self._get_observation(agent) for agent in self.agents}
+        observations = {agent: self.observation_space(agent) for agent in self.agents}
 
         # Optional info dict for additional data
         info = {}
-        for agent in self.possible_agents:
-            if agent in self.agents:
-                info[agent] = {
-                    "position": self.agent_positions[agent],
-                    "goal": self.agent_goals[agent],
-                    "carrying": self.agent_carrying[agent],
-                    "completed_tasks": self.completed_tasks[agent],
-                }
-            else:
-                # Basic info for inactive agents
-                info[agent] = {"active": False}
+        for agent in self.agents:
+            info[agent] = {
+                "position": self.agent_positions[agent],
+                "goal": self.agent_goals[agent],
+                "carrying": self.agent_carrying[agent],
+                "completed_tasks": self.completed_tasks[agent],
+            }
 
-        # Verify no agents are sharing positions
-        position_count = {}
-        for agent, pos in self.agent_positions.items():
-            if pos not in position_count:
-                position_count[pos] = []
-            position_count[pos].append(agent)
-
-        for pos, agents in position_count.items():
-            if len(agents) > 1:
-                print(f"WARNING: Position {pos} is shared by agents: {agents}")
-        
-        return observations, rewards, terminations, truncations, info
+        return observations, step_rewards, info
     
+    def _step_humans(self):
+        humans_order = list(self.humans)
+        random.shuffle(humans_order)
+
+        # Get actions for humans
+        human_actions = self.human_planner.get_actions(
+            humans=self.humans,
+            human_positions=self.human_positions,
+            human_goals=self.human_goals,
+            grid=self.grid,
+            grid_size=self.human_grid_size
+        )
+
+        for human in humans_order:
+            human_action = ActionType(human_actions[human])
+
+            if not human_action.is_movement():
+                continue
+        
+            current_pos = self.human_positions[human]
+            new_position = move_position(current_pos, human_action)
+            if not is_within_bounds(new_position, self.human_grid_size):
+                continue
+            
+
+            if self.grid[new_position] in [CellType.SHELF.value, CellType.AGENT.value]:
+                continue
+
+            self.grid[current_pos] = CellType.EMPTY.value
+            self.grid[new_position] = CellType.DYNAMIC_OBSTACLE.value
+            self.human_positions[human] = new_position
+
+    def _step_agents(self, actions: dict[AgentID, ActionType]) -> dict[AgentID, float]:
+       
+        def _handle_move(agent, agent_action) -> float:
+            current_pos = self.agent_positions[agent]
+            new_pos = move_position(current_pos, agent_action)
+            if not is_within_bounds(new_pos, self.grid_size):
+                # print("not within bounds")
+                return self.reward_table.collision_penalty
+            
+            if is_collission(new_pos, self.grid):
+                # print("collision")
+                return self.reward_table.collision_penalty
+            
+            if current_pos != new_pos and self.grid[new_pos] == CellType.EMPTY.value:
+                self.grid[new_pos] = CellType.AGENT.value
+                self.grid[current_pos] = CellType.EMPTY.value
+
+            self.agent_prev_positions[agent] = current_pos
+            self.agent_positions[agent] = new_pos
+            
+            reward = self.reward_table.step_penalty
+            
+            self.agent_position_histories[agent].append(new_pos)
+
+            # 1) punish simple back-and-forth oscillations
+            if self._check_oscillation(agent):
+                reward += self.reward_table.oscillation_penalty
+                # print("--------------------OSCILLATION PENALTY--------------------")
+
+            # 2) if not a 2-point oscillation, punish fixed-length cycles
+            elif self._check_cycle(agent):
+                reward += self.reward_table.oscillation_penalty
+                # print("--------------------CYCLE PENALTY--------------------")
+
+            return reward
+        
+        def _handle_pickup(agent) -> float:
+            # Penalties
+            current_pos = self.agent_positions[agent]
+            if current_pos not in self.pickup_points:
+                return self.reward_table.wrong_pickup_penalty
+
+            if self.agent_carrying[agent]:
+                # If we are carrying, we cannot pick up again, penalty
+                return self.reward_table.wrong_pickup_penalty
+
+            if current_pos in self.pickup_points and current_pos != self.agent_goals[agent]:
+                # At pickup point, but the wrong one
+                return self.reward_table.wrong_pickup_penalty
+            
+            if current_pos == self.agent_goals[agent]:
+                # Pickup point matches agent's goal, reward
+                self.remove_pickup_point(current_pos)
+                self.agent_carrying[agent] = True
+                self.grid[current_pos] = CellType.AGENT.value
+                self.agent_goals[agent] = self.get_random_dropoff_point()
+                return self.reward_table.task_reward
+            
+            raise ValueError("Error in pickup logic")
+            
+        def _handle_dropoff(agent) -> float:
+            # Penalties
+            current_pos = self.agent_positions[agent]
+            if not (current_pos in self.dropoff_points):
+                return self.reward_table.wrong_dropoff_penalty
+
+            if not self.agent_carrying[agent]:
+                # If we are not carrying, we cannot drop off, penalty
+                return self.reward_table.wrong_dropoff_penalty
+            
+            if current_pos in self.dropoff_points and current_pos != self.agent_goals[agent]:
+                # At dropoff point, but the wrong one
+                return self.reward_table.wrong_dropoff_penalty
+
+            # Rewards
+            if current_pos == self.agent_goals[agent]:
+                # Dropoff point matches agent's goal, reward
+                self.agent_carrying[agent] = False
+                self.completed_tasks[agent] += 1
+                new_pickup = self.create_pickup_point()
+                self.agent_goals[agent] = new_pickup
+                return self.reward_table.task_reward
+            
+            raise ValueError("Error in dropoff logic")
+        
+        def _handle_wait(agent) -> float:
+            # If we are waiting, we get a small penalty
+            current_pos = self.agent_positions[agent]
+            previous_pos = self.agent_prev_positions[agent]
+
+            if current_pos == previous_pos:
+                # If we are not moving, we get a small penalty
+                return self.reward_table.step_penalty * 2 * 4
+            
+            return self.reward_table.step_penalty * 2
+        
+        def _is_closer(old_pos, new_pos, goal_pos):
+            # Check if the new position is closer to the goal
+            old_distance = np.linalg.norm(np.array(old_pos) - np.array(goal_pos))
+            new_distance = np.linalg.norm(np.array(new_pos) - np.array(goal_pos))
+            return new_distance < old_distance
+            
+
+        # Process agents and humans in a random order to avoid bias
+        agents_order = list(self.agents)
+        random.shuffle(agents_order)
+        
+        rewards = {agent: 0 for agent in agents_order}
+
+        for agent in agents_order:
+            agent_action = ActionType(actions[agent])
+            
+            step_reward = 0
+            match agent_action:
+                case ActionType.LEFT | ActionType.DOWN | ActionType.RIGHT | ActionType.UP:
+                    step_reward = _handle_move(agent, agent_action)
+                    prev_pos = self.agent_prev_positions[agent]
+                    new_pos = self.agent_positions[agent]
+                    goal = self.agent_goals[agent]
+
+                    if _is_closer(prev_pos, new_pos, goal):
+                        step_reward += self.reward_table.correct_direction_reward
+                case ActionType.PICKUP:
+                    step_reward = _handle_pickup(agent)
+                case ActionType.DROP:
+                    step_reward = _handle_dropoff(agent)
+                case ActionType.WAIT:
+                    step_reward = _handle_wait(agent)
+                case _:
+                    step_reward = 0
+
+            rewards[agent] += step_reward
+            self.agent_prev_positions[agent] = self.agent_positions[agent]
+        return rewards
+
     def render(self):
         """Render the warehouse environment with support for up to 10 agents"""
-        if self.render_mode == 'human':
-            # Initialize the figure on first call
-            if not hasattr(self, 'fig') or not plt.fignum_exists(self.fig.number):
-                self.fig = plt.figure(figsize=(12, 10), num="Warehouse Environment")
-                self.ax = plt.subplot(111)
-                
-                # Create a more attractive button instead of a checkbox
-                self.button_ax = plt.axes([0.05, 0.02, 0.15, 0.05])  # [left, bottom, width, height]
-                self.show_goal_lines = True  # Default state
-                self.button_text = "Hide Goal Lines" if self.show_goal_lines else "Show Goal Lines"
-                self.button = Button(
-                    self.button_ax, self.button_text,
-                    color='lightblue', hovercolor='skyblue'
-                )
-                self.button.on_clicked(self._toggle_goal_lines)
-                
-                # Store agent goal lines for toggling visibility
-                self.goal_lines = []
-            else:
-                # Clear the previous content but keep the figure
-                self.ax.clear()
-                self.goal_lines = []  # Clear old goal lines references
+        if self.render_mode != 'human':
+            return 
 
-            # Draw a white background grid first
-            background = np.zeros(self.grid_size)
-            self.ax.imshow(background, cmap='Greys', alpha=0.1, origin='upper')
-
-            # Set up the grid
-            self.ax.set_xlim(-0.5, self.grid_size[1] - 0.5)
-            self.ax.set_ylim(-0.5, self.grid_size[0] - 0.5)
-            self.ax.set_xticks(np.arange(-0.5, self.grid_size[1], 1), minor=True)
-            self.ax.set_yticks(np.arange(-0.5, self.grid_size[0], 1), minor=True)
-            self.ax.grid(which='minor', color='grey', linestyle='-', linewidth=0.5)
-
-            # Remove axis labels and ticks for cleaner look
-            self.ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
-
-            # Get figure size to calculate dynamic font and table scaling
-            fig_width, fig_height = self.fig.get_size_inches()
-            scale_factor = min(fig_width/12.0, fig_height/10.0)  # Base scale on original size
-
-            # Define title and info text font sizes that scale with window size
-            title_size = max(14, int(16 * scale_factor))
-            info_size = max(10, int(12 * scale_factor))
-            info_text = f"Step: {self.steps}   |   Agents: {len(self.agents)}   |   Humans: {len(self.humans)}"
+        # Initialize the figure on first call
+        if not hasattr(self, 'fig') or not plt.fignum_exists(self.fig.number):
+            self.fig = plt.figure(figsize=(12, 10), num="Warehouse Environment")
+            self.ax = plt.subplot(111)
             
-            # Create title with main title and info text
-            title = f"Multi-Agent Warehouse Environment\n\n{info_text}"
+            # Create a more attractive button instead of a checkbox
+            self.button_ax = plt.axes([0.05, 0.02, 0.15, 0.05])  # [left, bottom, width, height]
+            self.show_goal_lines = True  # Default state
+            self.button_text = "Hide Goal Lines" if self.show_goal_lines else "Show Goal Lines"
+            self.button = Button(
+                self.button_ax, self.button_text,
+                color='lightblue', hovercolor='skyblue'
+            )
+            self.button.on_clicked(self._toggle_goal_lines)
             
-            # Set title with proper padding
-            self.ax.set_title(title, 
-                             fontsize=title_size,
-                             fontweight='bold', 
-                             pad=25)
+            # Store agent goal lines for toggling visibility
+            self.goal_lines = []
+        else:
+            # Clear the previous content but keep the figure
+            self.ax.clear()
+            self.goal_lines = []  # Clear old goal lines references
+
+        # Draw a white background grid first
+        background = np.zeros(self.grid_size)
+        self.ax.imshow(background, cmap='Greys', alpha=0.1, origin='upper')
+
+        # Set up the grid
+        self.ax.set_xlim(-0.5, self.grid_size[1] - 0.5)
+        self.ax.set_ylim(self.grid_size[0] - 0.5, -0.5)
+        self.ax.set_xticks(np.arange(-0.5, self.grid_size[1], 1), minor=True)
+        self.ax.set_yticks(np.arange(-0.5, self.grid_size[0], 1), minor=True)
+        self.ax.grid(which='minor', color='grey', linestyle='-', linewidth=0.5)
+
+        # Remove axis labels and ticks for cleaner look
+        self.ax.tick_params(left=False, bottom=False, labelleft=False, labelbottom=False)
+
+        # Get figure size to calculate dynamic font and table scaling
+        fig_width, fig_height = self.fig.get_size_inches()
+        scale_factor = min(fig_width/12.0, fig_height/10.0)  # Base scale on original size
+
+        # Define title and info text font sizes that scale with window size
+        title_size = max(14, int(16 * scale_factor))
+        info_size = max(10, int(12 * scale_factor))
+        info_text = f"Step: {self.steps}   |   Agents: {len(self.agents)}   |   Humans: {len(self.humans)}"
+        
+        # Create title with main title and info text
+        title = f"Multi-Agent Warehouse Environment\n\n{info_text}"
+        
+        # Set title with proper padding
+        self.ax.set_title(title, 
+                            fontsize=title_size,
+                            fontweight='bold', 
+                            pad=25)
+        
+        # Position title and adjust styling
+        title_obj = self.ax.title
+        title_obj.set_y(1.05)
+        
+        try:
+            # Split title into separate components for better styling
+            title_text = title_obj.get_text()
+            lines = title_text.split('\n')
             
-            # Position title and adjust styling
-            title_obj = self.ax.title
-            title_obj.set_y(1.05)
+            # Clear existing title
+            self.ax.set_title("")
             
-            try:
-                # Split title into separate components for better styling
-                title_text = title_obj.get_text()
-                lines = title_text.split('\n')
-                
-                # Clear existing title
-                self.ax.set_title("")
-                
-                # Add main title at the top
-                self.ax.text(0.5, 1.08, lines[0], 
+            # Add main title at the top
+            self.ax.text(0.5, 1.08, lines[0], 
+                        transform=self.ax.transAxes,
+                        ha='center', va='center', 
+                        fontsize=title_size, 
+                        fontweight='bold')
+            
+            # Add info text with background below title
+            if len(lines) > 2:
+                self.ax.text(0.5, 1.03, lines[2],
                             transform=self.ax.transAxes,
                             ha='center', va='center', 
-                            fontsize=title_size, 
-                            fontweight='bold')
-                
-                # Add info text with background below title
-                if len(lines) > 2:
-                    self.ax.text(0.5, 1.03, lines[2],
-                                transform=self.ax.transAxes,
-                                ha='center', va='center', 
-                                fontsize=info_size,
-                                fontweight='bold',
-                                bbox=dict(facecolor='lightblue', alpha=0.5, boxstyle='round,pad=0.5'))
-            except Exception:
-                # Fallback if text splitting fails
-                pass
+                            fontsize=info_size,
+                            fontweight='bold',
+                            bbox=dict(facecolor='lightblue', alpha=0.5, boxstyle='round,pad=0.5'))
+        except Exception:
+            # Fallback if text splitting fails
+            pass
+        
+        # Create space for title and info
+        self.fig.subplots_adjust(top=0.85)
+
+        # Draw shelves as black squares
+        shelf_r, shelf_c = [], []
+        for r in range(self.grid_size[0]):
+            for c in range(self.grid_size[1]):
+                if self.grid[r, c] == 2:  # Shelf
+                    shelf_r.append(r)
+                    shelf_c.append(c)
+        if shelf_r:
+            self.ax.scatter(shelf_c, shelf_r, s=180, marker='s', color='black', label='Shelf')
+
+        # Draw pickup points as green grid cells
+        for pos in self.pickup_points:
+            r, c = pos
+            rect = plt.Rectangle((c-0.5, r-0.5), 1, 1, facecolor='limegreen', alpha=0.4, edgecolor='limegreen')
+            self.ax.add_patch(rect)
+
+        # Draw dropoff points as red grid cells
+        for pos in self.dropoff_points:
+            r, c = pos
+            rect = plt.Rectangle((c-0.5, r-0.5), 1, 1, facecolor='tomato', alpha=0.4, edgecolor='tomato')
+            self.ax.add_patch(rect)
+
+        # Define distinct colors for up to 10 agents
+        agent_colors = [
+            'darkorange', 'mediumblue', 'purple', 'deeppink', 'teal',
+            'darkgoldenrod', 'darkred', 'forestgreen', 'brown', 'slateblue'
+        ]
+
+        # Create legend elements for environment components
+        env_legend_elements = [
+            plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='black', markersize=12, label='Shelf'),
+            plt.Rectangle((0, 0), 1, 1, facecolor='limegreen', alpha=0.4, label='Pickup Point'),
+            plt.Rectangle((0, 0), 1, 1, facecolor='tomato', alpha=0.4, label='Dropoff Point'),
+            plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='black', markersize=12, label='Human')
+        ]
+
+        # Prepare agent legend elements
+        agent_legend_elements = []
+
+        # Draw each agent with its goal
+        for i, agent in enumerate(self.agents):
+            color_idx = i % len(agent_colors)
+            agent_color = agent_colors[color_idx]
+            pos = self.agent_positions[agent]
+            goal = self.agent_goals[agent]
+            carrying = self.agent_carrying[agent]
+
+            # Draw agent as a colored circle with black edge
+            self.ax.scatter(pos[1], pos[0], s=180, marker='o',
+                            color=agent_color,
+                            edgecolors='black', linewidth=1.5)
             
-            # Create space for title and info
-            self.fig.subplots_adjust(top=0.85)
+            # Add + or - to indicate carrying status
+            if carrying:
+                self.ax.text(pos[1], pos[0] - 0.02, "+", 
+                            ha='center', va='center', fontsize=14, 
+                            fontweight='bold', color='white')
+            else:
+                self.ax.text(pos[1], pos[0], "-", 
+                            ha='center', va='center', fontsize=16, 
+                            fontweight='bold', color='white')
 
-            # Draw shelves as black squares
-            shelf_r, shelf_c = [], []
-            for r in range(self.grid_size[0]):
-                for c in range(self.grid_size[1]):
-                    if self.grid[r, c] == 2:  # Shelf
-                        shelf_r.append(r)
-                        shelf_c.append(c)
-            if shelf_r:
-                self.ax.scatter(shelf_c, shelf_r, s=180, marker='s', color='black', label='Shelf')
-
-            # Draw pickup points as green grid cells
-            for pos in self.pickup_points:
-                r, c = pos
-                rect = plt.Rectangle((c-0.5, r-0.5), 1, 1, facecolor='limegreen', alpha=0.4, edgecolor='limegreen')
-                self.ax.add_patch(rect)
-
-            # Draw dropoff points as red grid cells
-            for pos in self.dropoff_points:
-                r, c = pos
-                rect = plt.Rectangle((c-0.5, r-0.5), 1, 1, facecolor='tomato', alpha=0.4, edgecolor='tomato')
-                self.ax.add_patch(rect)
-
-            # Define distinct colors for up to 10 agents
-            agent_colors = [
-                'darkorange', 'mediumblue', 'purple', 'deeppink', 'teal',
-                'darkgoldenrod', 'darkred', 'forestgreen', 'brown', 'slateblue'
-            ]
-
-            # Create legend elements for environment components
-            env_legend_elements = [
-                plt.Line2D([0], [0], marker='s', color='w', markerfacecolor='black', markersize=12, label='Shelf'),
-                plt.Rectangle((0, 0), 1, 1, facecolor='limegreen', alpha=0.4, label='Pickup Point'),
-                plt.Rectangle((0, 0), 1, 1, facecolor='tomato', alpha=0.4, label='Dropoff Point'),
-                plt.Line2D([0], [0], marker='o', color='w', markerfacecolor='black', markersize=12, label='Human')
-            ]
-
-            # Prepare agent legend elements
-            agent_legend_elements = []
-
-            # Draw each agent with its goal
-            for i, agent in enumerate(self.agents):
-                color_idx = i % len(agent_colors)
-                agent_color = agent_colors[color_idx]
-                pos = self.agent_positions[agent]
-                goal = self.agent_goals[agent]
-                carrying = self.agent_carrying[agent]
-
-                # Draw agent as a colored circle with black edge
-                self.ax.scatter(pos[1], pos[0], s=180, marker='o',
-                                color=agent_color,
-                                edgecolors='black', linewidth=1.5)
-                
-                # Add + or - to indicate carrying status
-                if carrying:
-                    self.ax.text(pos[1], pos[0] - 0.02, "+", 
-                                ha='center', va='center', fontsize=14, 
-                                fontweight='bold', color='white')
-                else:
-                    self.ax.text(pos[1], pos[0], "-", 
-                                ha='center', va='center', fontsize=16, 
-                                fontweight='bold', color='white')
-
-                # Connect agent to goal with a dotted line
-                line = self.ax.plot([pos[1], goal[1]], [pos[0], goal[0]], 
-                            color=agent_color, linestyle='--', linewidth=2.0, alpha=0.8)[0]
-                self.goal_lines.append(line)
-                
-                # Set line visibility based on toggle state
-                line.set_visible(self.show_goal_lines)
-                
-                # Add agent to legend with carrying status
-                carry_status = "+" if carrying else "-"
-                agent_legend_elements.append(
-                    plt.Line2D([0], [0], marker='o', color='w',
-                            markerfacecolor=agent_color,
-                            markersize=12,
-                            label=f"Agent {i} ({carry_status})")
-                )
-
-            # Draw humans as black circles
-            for human in self.humans:
-                human_color = "black"
-                pos = self.human_positions[human]
-                
-                self.ax.scatter(pos[1], pos[0], s=180, marker='o',
-                                color=human_color,
-                                edgecolors='black', linewidth=1.5)
+            # Connect agent to goal with a dotted line
+            line = self.ax.plot([pos[1], goal[1]], [pos[0], goal[0]], 
+                        color=agent_color, linestyle='--', linewidth=2.0, alpha=0.8)[0]
+            self.goal_lines.append(line)
             
-            # Add environment legend
-            first_legend = self.ax.legend(handles=env_legend_elements,
-                                        bbox_to_anchor=(1.05, 1),
-                                        loc='upper left',
-                                        title="Environment")
-
-            # Keep first legend when adding second
-            self.ax.add_artist(first_legend)
+            # Set line visibility based on toggle state
+            line.set_visible(self.show_goal_lines)
             
-            # Add agents legend
-            second_legend = self.ax.legend(handles=agent_legend_elements,
-                                        bbox_to_anchor=(1.25, 1),
-                                        loc='upper left',
-                                        title="Agents")
+            # Add agent to legend with carrying status
+            carry_status = "+" if carrying else "-"
+            agent_legend_elements.append(
+                plt.Line2D([0], [0], marker='o', color='w',
+                        markerfacecolor=agent_color,
+                        markersize=12,
+                        label=f"Agent {i} ({carry_status})")
+            )
 
-            # Calculate dynamic font sizes for tables
-            table_font_size = max(8, int(10 * scale_factor))
-            title_font_size = max(10, int(12 * scale_factor))
+        # Draw humans as black circles
+        for human in self.humans:
+            human_color = "black"
+            pos = self.human_positions[human]
             
-            # Prepare data for completed deliveries table
-            table_data = []
-            for i, agent in enumerate(sorted(self.agents)):
-                color_idx = i % len(agent_colors)
-                agent_color = agent_colors[color_idx]
-                table_data.append([f"Agent {i}", f"{self.completed_tasks[agent]}"])
+            self.ax.scatter(pos[1], pos[0], s=180, marker='o',
+                            color=human_color,
+                            edgecolors='black', linewidth=1.5)
+        
+        # Add environment legend
+        first_legend = self.ax.legend(handles=env_legend_elements,
+                                    bbox_to_anchor=(1.05, 1),
+                                    loc='upper left',
+                                    title="Environment")
 
-            # Create main table with delivery counts
-            table_height = min(0.3, 0.05 * len(table_data) + 0.1)
-            table = self.ax.table(cellText=table_data,
-                                colLabels=["Agent", "Deliveries"],
-                                loc='center right',
-                                cellLoc='center',
-                                bbox=[1.05, 0.25, 0.2, table_height])
+        # Keep first legend when adding second
+        self.ax.add_artist(first_legend)
+        
+        # Add agents legend
+        second_legend = self.ax.legend(handles=agent_legend_elements,
+                                    bbox_to_anchor=(1.25, 1),
+                                    loc='upper left',
+                                    title="Agents")
 
-            # Style main table with dynamic sizing
-            table.auto_set_font_size(False)
-            table.set_fontsize(table_font_size)
-            table.scale(1.2 * scale_factor, 1.5 * scale_factor)
+        # Calculate dynamic font sizes for tables
+        table_font_size = max(8, int(10 * scale_factor))
+        title_font_size = max(10, int(12 * scale_factor))
+        
+        # Prepare data for completed deliveries table
+        table_data = []
+        for i, agent in enumerate(sorted(self.agents)):
+            color_idx = i % len(agent_colors)
+            agent_color = agent_colors[color_idx]
+            table_data.append([f"Agent {i}", f"{self.completed_tasks[agent]}"])
 
-            # Style table cells with colors
-            for (i, j), cell in table.get_celld().items():
-                if i == 0:  # Header row
-                    cell.set_text_props(fontweight='bold')
-                    cell.set_facecolor('lightgray')
-                elif j == 0:  # Agent column
-                    agent_idx = i - 1
-                    color_idx = agent_idx % len(agent_colors)
-                    color = plt.matplotlib.colors.to_rgba(agent_colors[color_idx], alpha=0.2)
-                    cell.set_facecolor(color)
-                elif j == 1:  # Deliveries column
-                    cell.set_facecolor('#f8f8f8')
+        # Create main table with delivery counts
+        table_height = min(0.3, 0.05 * len(table_data) + 0.1)
+        table = self.ax.table(cellText=table_data,
+                            colLabels=["Agent", "Deliveries"],
+                            loc='center right',
+                            cellLoc='center',
+                            bbox=[1.05, 0.25, 0.2, table_height])
 
-            # Calculate table width based on content
-            title_text = "Completed Deliveries"
-            table_width = max(0.2, len(title_text) * 0.015 * scale_factor)  
-            
-            # Create title table for deliveries section
-            title_bbox = [1.05, 0.55, table_width, 0.05]
-            title_table = self.ax.table(cellText=[[title_text]],
-                                        loc='center right',
-                                        cellLoc='center',
-                                        bbox=title_bbox)
+        # Style main table with dynamic sizing
+        table.auto_set_font_size(False)
+        table.set_fontsize(table_font_size)
+        table.scale(1.2 * scale_factor, 1.5 * scale_factor)
 
-            # Style title table
-            title_cell = title_table._cells[(0, 0)]
-            title_cell.set_text_props(fontweight='bold', fontsize=title_font_size)
-            title_cell.set_facecolor('lightgray')
-            title_table.auto_set_font_size(False)
-            title_table.set_fontsize(title_font_size)
-            title_table.scale(1.2 * scale_factor, 1.0 * scale_factor)
-            
-            # Ensure both tables use consistent width
-            table._bbox = [1.05, 0.25, table_width, table_height]
+        # Style table cells with colors
+        for (i, j), cell in table.get_celld().items():
+            if i == 0:  # Header row
+                cell.set_text_props(fontweight='bold')
+                cell.set_facecolor('lightgray')
+            elif j == 0:  # Agent column
+                agent_idx = i - 1
+                color_idx = agent_idx % len(agent_colors)
+                color = plt.matplotlib.colors.to_rgba(agent_colors[color_idx], alpha=0.2)
+                cell.set_facecolor(color)
+            elif j == 1:  # Deliveries column
+                cell.set_facecolor('#f8f8f8')
 
-            # Draw figure and display
-            self.fig.tight_layout()
-            self.fig.canvas.draw()
-            plt.pause(0.01)
-            return self.fig
+        # Calculate table width based on content
+        title_text = "Completed Deliveries"
+        table_width = max(0.2, len(title_text) * 0.015 * scale_factor)  
+        
+        # Create title table for deliveries section
+        title_bbox = [1.05, 0.55, table_width, 0.05]
+        title_table = self.ax.table(cellText=[[title_text]],
+                                    loc='center right',
+                                    cellLoc='center',
+                                    bbox=title_bbox)
+
+        # Style title table
+        title_cell = title_table._cells[(0, 0)]
+        title_cell.set_text_props(fontweight='bold', fontsize=title_font_size)
+        title_cell.set_facecolor('lightgray')
+        title_table.auto_set_font_size(False)
+        title_table.set_fontsize(title_font_size)
+        title_table.scale(1.2 * scale_factor, 1.0 * scale_factor)
+        
+        # Ensure both tables use consistent width
+        table._bbox = [1.05, 0.25, table_width, table_height]
+
+        # Draw figure and display
+        self.fig.tight_layout()
+        self.fig.canvas.draw()
+        plt.pause(0.01)
+        return self.fig
 
     def _toggle_goal_lines(self, event):
         """Toggle visibility of goal lines when button is clicked"""
@@ -664,63 +743,7 @@ class WarehouseEnv(ParallelEnv):
         
         self.fig.canvas.draw_idle()  # Redraw the figure to show changes
 
-    def _fourth_pass(self, agent, action, current_pos, rewards):
-        """
-        Handles pickup/dropoff/wait actions for the agent, applies appropriate rewards/penalties.
-        """
-        # Distance to goal
-        goal = self.agent_goals[agent]
-        prev_pos = self.previous_positions[agent]
-        # 4: Pickup Item
-        if action == 4:
-            if not self.agent_carrying[agent]:
-                if current_pos in self.pickup_points:
-                    # Correct pickup
-                    self.agent_carrying[agent] = True
-                    # Assign dropoff point (random for now)
-                    dropoff_idx = random.randrange(len(self.dropoff_points))
-                    self.agent_item_types[agent] = dropoff_idx
-                    self.agent_goals[agent] = self.dropoff_points[dropoff_idx]
-                    # Task reward will be given on dropoff
-                else:
-                    # Wrong pickup point, heavy penalty
-                    rewards[agent] += self.invalid_action_penalty
-            else:
-                # Already carrying, can't pick up
-                rewards[agent] += self.invalid_action_penalty
-        # 5: Drop Item
-        elif action == 5:
-            if self.agent_carrying[agent]:
-                dropoff_idx = self.agent_item_types[agent]
-                if current_pos == self.dropoff_points[dropoff_idx]:
-                    # Correct dropoff
-                    self.agent_carrying[agent] = False
-                    self.completed_tasks[agent] += 1
-                    # Assign new pickup point (random for now)
-                    pickup_idx = random.randrange(len(self.pickup_points))
-                    self.agent_item_types[agent] = None
-                    self.agent_goals[agent] = self.pickup_points[pickup_idx]
-                    rewards[agent] += self.task_reward
-                else:
-                    # Wrong dropoff point, heavy penalty
-                    rewards[agent] += self.invalid_action_penalty
-            else:
-                # Not carrying, can't drop
-                rewards[agent] += self.invalid_action_penalty
-        # Handle wait action (6)
-        elif action == 6:
-            # No action taken, just wait
-            # Add a small penalty for waiting
-            factor = 1
-            if prev_pos == current_pos:
-                factor = 4
-            rewards[agent] += 2 * self.step_cost * factor
-            pass
-        # Movement actions (0-3): no special handling here
-        else:
-            pass
-
-    def _get_observation(self, agent):
+    def observation_space(self, agent: AgentID) -> spaces.Space:
         """
         Generate observation for an agent
         """
@@ -729,11 +752,11 @@ class WarehouseEnv(ParallelEnv):
         agent_pos = self.agent_positions[agent]
 
         # Initialize observation channels
-        obs = np.zeros((10,) + self.local_observation_size, dtype=np.float32)
+        obs = np.zeros((10,) + self.observation_size, dtype=np.float32)
 
         # Extract the local observation window (5x5 grid around the agent)
         r, c = agent_pos
-        window_size = self.local_observation_size[0] // 2
+        window_size = self.observation_size[0] // 2
 
         # For each cell in the observation window
         for i in range(-window_size, window_size + 1):
@@ -773,19 +796,20 @@ class WarehouseEnv(ParallelEnv):
                     # Channel 7: Dropoff points
                     obs[6, lr, lc] = 1 if (gr, gc) in self.dropoff_points else 0
 
+                else:
+                    obs[2, lr, lc] = 1
         # Channel 8: Agent's carrying status
         obs[7, :, :] = 1 if self.agent_carrying[agent] else 0
 
         # Channel 9: Valid pickup/drop indicator
         if self.agent_carrying[agent]:
             # If carrying, mark valid dropoff points
-            dropoff_idx = self.agent_item_types[agent]
             for i in range(-window_size, window_size + 1):
                 for j in range(-window_size, window_size + 1):
                     gr, gc = r + i, c + j
                     lr, lc = i + window_size, j + window_size
                     if 0 <= gr < self.grid_size[0] and 0 <= gc < self.grid_size[1]:
-                        if (gr, gc) == self.dropoff_points[dropoff_idx]:
+                        if (gr, gc) == self.agent_goals[agent]:
                             obs[8, lr, lc] = 1
         else:
             # If not carrying, mark all pickup points as valid
@@ -829,15 +853,15 @@ class WarehouseEnv(ParallelEnv):
 
             obs[9, 0, 0] = 1
         
-            
-        # print(f"\nAgent {agent} - Direction to goal: {direction}")
-        # for row in range(len(obs[9])):
-        #     print("")
-        #     for col in range(len(obs[9][row])):
-        #         fig = "·" if obs[9][row][col] == 0 else "X"
-        #         print(f"{fig:^5}", end=" ")
         
         return obs
+    
+    def action_space(self, agent: AgentID) -> spaces.Space:
+        """
+        Return the action space for the given agent.
+        """
+        # The agent can choose among all ActionType values
+        return spaces.Discrete(len(ActionType))
     
     def _get_human_observation(self, human):
         """
@@ -935,290 +959,184 @@ class WarehouseEnv(ParallelEnv):
 
         return global_state, additional_info
 
-    def _place_shelves(self):
+    def get_pickup_points(self) -> list[tuple[int, int]]:
         """
-        Place shelves in a warehouse-like layout with proper aisles
-        - Shelf blocks are 2 wide, 4 long
-        - Vertical aisles are 2 cells wide
-        - Perimeter has 2-cell wide clearance
-        - Shelf count respects self.num_shelves
+        Get the pickup points in the environment
         """
-        # First clear grid
-        self.grid[:, :] = 0
-        
-        # Parameters for shelf layout
-        shelf_width = 2       # Width of each shelf block (vertical size)
-        shelf_length = 4      # Length of each shelf block (horizontal size)
-        aisle_width = 2       # Width of vertical aisles between shelf blocks
-        perimeter_width = 2   # Empty space around the perimeter
-        
-        # Calculate usable area (excluding perimeter)
-        usable_height = self.grid_size[0] - 2 * perimeter_width
-        usable_width = self.grid_size[1] - 2 * perimeter_width
-        
-        # Calculate spacing
-        h_spacing = shelf_width + aisle_width    # Vertical spacing between shelf blocks
-        w_spacing = shelf_length + aisle_width   # Horizontal spacing between shelf blocks
-        
-        # Calculate maximum number of shelf blocks
-        num_row_blocks = (usable_height + aisle_width) // h_spacing  # +aisle_width because we don't need an aisle after the last row
-        num_col_blocks = (usable_width + aisle_width) // w_spacing   # +aisle_width because we don't need an aisle after the last column
-        
-        # Calculate total number of shelf cells available
-        total_shelf_cells = num_row_blocks * num_col_blocks * shelf_width * shelf_length
-        
-        # Limit by specified number
-        shelf_target = min(self.num_shelves, total_shelf_cells)
-        shelf_cells_placed = 0
-        
-        # Place shelves
-        for row_block in range(num_row_blocks):
-            if shelf_cells_placed >= shelf_target:
-                break
-                
-            for col_block in range(num_col_blocks):
-                if shelf_cells_placed >= shelf_target:
-                    break
-                    
-                # Calculate the top-left corner of this shelf block
-                start_row = perimeter_width + row_block * h_spacing
-                start_col = perimeter_width + col_block * w_spacing
-                
-                # Place the shelf cells for this block
-                for i in range(shelf_width):
-                    if start_row + i >= self.grid_size[0]:
-                        continue
-                        
-                    for j in range(shelf_length):
-                        if start_col + j >= self.grid_size[1]:
-                            continue
-                            
-                        if shelf_cells_placed < shelf_target:
-                            self.grid[start_row + i, start_col + j] = 2  # Mark as shelf
-                            shelf_cells_placed += 1
-        
-        # Ensure all aisles are clear
-        # Vertical aisles
-        for col_block in range(num_col_blocks + 1):
-            aisle_col = perimeter_width + col_block * w_spacing - aisle_width
-            if col_block > 0:  # Only clear aisles between shelf blocks
-                for r in range(perimeter_width, self.grid_size[0] - perimeter_width):
-                    for c in range(aisle_width):
-                        if 0 <= aisle_col + c < self.grid_size[1]:
-                            self.grid[r, aisle_col + c] = 0  # Clear aisle
-        
-        # Horizontal aisles
-        for row_block in range(num_row_blocks + 1):
-            aisle_row = perimeter_width + row_block * h_spacing - aisle_width
-            if row_block > 0:  # Only clear aisles between shelf blocks
-                for c in range(perimeter_width, self.grid_size[1] - perimeter_width):
-                    for r in range(aisle_width):
-                        if 0 <= aisle_row + r < self.grid_size[0]:
-                            self.grid[aisle_row + r, c] = 0  # Clear aisle
-        
-        # Ensure perimeter is clear
-        for r in range(self.grid_size[0]):
-            for c in range(self.grid_size[1]):
-                if r < perimeter_width or r >= self.grid_size[0] - perimeter_width or \
-                   c < perimeter_width or c >= self.grid_size[1] - perimeter_width:
-                    self.grid[r, c] = 0  # Clear perimeter
+        pickup_points = []
+        for i in range(self.grid_size[0]):
+            for j in range(self.grid_size[1]):
+                if self.grid_points[i, j] == CellType.PICKUP_POINT.value:
+                    pickup_points.append((i, j))
 
-    def _place_random_points(self, num_points, avoid_values):
-        """
-        Place random points on the grid, avoiding certain cell types
-        """
-        points = []
-        for _ in range(num_points):
-            pos = get_random_empty_position(grid=self.grid, grid_size=self.grid_size, avoid_values=avoid_values)
-            points.append(pos)
-        return points
+        # print(f"Pickup points: {pickup_points}")
+        return pickup_points
 
+    def refresh_pickup_points(self):
+        self.pickup_points = self.get_pickup_points()
 
-    def _place_dropoff_points(self):
-        """
-        Hardcode dropoff points in the corners of the grid.
-        """
-        # Corners of the grid
-        corners = [
-            (0, 0),  # Top-left corner
-            (0, self.grid_size[1] - 1),  # Top-right corner
-            (self.grid_size[0] - 1, 0),  # Bottom-left corner
-            (self.grid_size[0] - 1, self.grid_size[1] - 1)  # Bottom-right corner
-        ]
-        # Middle point of the grid
-        # Middle points of the edges
-        middle_edges = [
-            (0, self.grid_size[1] // 2),  # Middle of the bottom edge
-            (self.grid_size[0] - 1, self.grid_size[1] // 2),  # Middle of the top edge
-            (self.grid_size[0] // 2, 0),  # Middle of the left edge
-            (self.grid_size[0] // 2, self.grid_size[1] - 1)  # Middle of the right edge
-        ]
-        all_dropoff_points = corners + middle_edges
-        
-        self.dropoff_points = all_dropoff_points[:self.num_dropoff_points]
-        for pos in self.dropoff_points:
-            self.grid[pos] = 5
-            
-    def _assign_new_goal(self, agent):
-        """
-        Assign a new goal to the agent
-        """
-        
-        if self.agent_carrying[agent]:
-            # If agent is carrying an item, deliver it to appropriate dropoff point
-            # dropoff_idx = self.agent_item_types[agent] ------Not sure about why there is item_typs here-------
-            # dropoff_idx should be based on the dropoff points
-            dropoff_idx = random.randint(0, len(self.dropoff_points) - 1)
-            
-            self.agent_goals[agent] = self.dropoff_points[dropoff_idx]
-        else:
-            # Avoid spawning pickups on agents (1), shelves (2), dynamic obstacles (3), or dropoffs (5)
-            pos = get_random_empty_position(grid=self.grid, grid_size=self.grid_size, avoid_values=[1, 2, 3, 4, 5])
-            self.pickup_points.append(pos)
-            self.grid[pos] = 4  # Mark as pickup point
-            self.agent_goals[agent] = pos
-            
-            # If agent is not carrying an item, go to a random pickup point
-            # pickup_idx = random.randint(0, len(self.pickup_points) - 1)
-            # self.agent_goals[agent] = self.pickup_points[pickup_idx]
-            
-    def _fourth_pass(self, agent, action, current_pos, rewards):
-        # Distance to goal
-        goal = self.agent_goals[agent]
-        prev_pos = self.previous_positions[agent]
-
-        # Potential-based reward shaping
-        if prev_pos is not None:
-            prev_dist = abs(prev_pos[0] - goal[0]) + abs(prev_pos[1] - goal[1])
-            curr_dist = abs(current_pos[0] - goal[0]) + abs(current_pos[1] - goal[1])
-            # Potential-based shaping: Phi(s) = -distance_to_goal(s)
-            # shaping reward = gamma * Phi(s') - Phi(s) = prev_dist - shaping_gamma * curr_dist
-            shaping_reward = prev_dist - self.shaping_gamma * curr_dist
-            rewards[agent] += shaping_reward
-            # The old step_closer_reward is replaced by shaping_reward
-
-        # Handle pickup action (4)
-        if action == 4:
-            # Check if agent is at a pickup point and not carrying an item
-            if current_pos in self.pickup_points and not self.agent_carrying[agent]:
-                # Check if this pickup point matches the agent's goal
-                if current_pos == self.agent_goals[agent]:
-                    # Agent can pick up item
-                    self.agent_carrying[agent] = True
-                    rewards[agent] += self.task_reward  # Reward for picking up an item
-
-                    # Remember which item type was picked up
-                    pickup_idx = self.pickup_points.index(current_pos)
-                    self.agent_item_types[agent] = pickup_idx % len(self.dropoff_points)
-
-                    self.pickup_points.remove(current_pos)  # Remove pickup point from grid
-                    self.grid[current_pos] = 0  # Clear the pickup point from the grid
-
-                    # Assign new goal (dropoff point)
-                    self._assign_new_goal(agent)
-
-                else:
-                    # Wrong pickup point, small penalty
-                    rewards[agent] += self.wrong_pickup_penalty
-
-        # Handle dropoff action (5)
-        elif action == 5:
-            # Check if agent is at a dropoff point and carrying an item
-            if current_pos in self.dropoff_points and self.agent_carrying[agent]:
-                # Check if this dropoff point matches the agent's goal
-                if current_pos == self.agent_goals[agent]:
-                    # Agent can drop off item
-                    self.agent_carrying[agent] = False
-                    rewards[agent] += self.task_reward  # Reward for dropping off an item
-
-                    # Increment completed tasks
-                    self.completed_tasks[agent] += 1
-
-                    # Assign new goal (pickup point)
-                    self._assign_new_goal(agent)
-                else:
-                    # Wrong dropoff point, small penalty
-                    rewards[agent] += self.wrong_dropoff_penalty
-
-        # Handle wait action (6)
-        elif action == 6:
-            # No action taken, just wait
-            # Add a small penalty for waiting
-            factor = 1
-            if prev_pos == current_pos:
-                factor = 4
-            rewards[agent] += 2 * self.step_cost * factor
-            pass
-
-def second_pass(entities_order, current_positions, new_positions, actions, all_entities, reserved_positions, allow_overlap=False):
-    final_positions = {}
-    collision_entities = set()
+    def get_random_dropoff_point(self) -> tuple[int, int]:
+        dropoff_idx = random.randint(0, len(self.dropoff_points) - 1)
+        return self.dropoff_points[dropoff_idx]
     
-    # Initial claims on positions:
-    for entity in all_entities:
-        pos = current_positions[entity]
-        if pos not in reserved_positions:
-            reserved_positions[pos] = entity
-
-    for entity in entities_order:
-        action_val = actions[entity]
-        intended_pos = new_positions[entity]
-        current_pos = current_positions[entity]
-        
-        # Non-movement actions (4-6): stay in place.
-        if action_val >= 4:
-            if current_pos in reserved_positions and reserved_positions[current_pos] != entity:
-                collision_entities.add(entity)
-            else:
-                final_positions[entity] = current_pos
-                reserved_positions[current_pos] = entity
-            continue
-        
-        # For movement actions (0-3):
-        if intended_pos in reserved_positions:
-            occupant = reserved_positions[intended_pos]
-            # Allow overlap only if:
-            #   - allow_overlap flag is True,
-            #   - and both entity and occupant are humans.
-            if allow_overlap and entity.startswith("human") and occupant.startswith("human"):
-                final_positions[entity] = intended_pos
-            else:
-                collision_entities.add(entity)
-                # Stay in current position.
-                if current_pos not in reserved_positions or reserved_positions[current_pos] == entity:
-                    final_positions[entity] = current_pos
-                    reserved_positions[current_pos] = entity
-                else:
-                    final_positions[entity] = current_pos
-            continue
-        
-        # Check for swapping positions:
-        swap_collision = any(
-            other_entity != entity and
-            current_positions[other_entity] == intended_pos and
-            new_positions.get(other_entity) == current_pos and
-            not allow_overlap
-            for other_entity in all_entities
+    def create_pickup_point(self):
+        """
+        Create a new pickup point in the grid
+        """
+        # Get a random empty position in the grid
+        new_pickup_pos = get_random_empty_position(
+            grid=self.grid, grid_size=self.grid_size, avoid_values=[
+                CellType.AGENT.value,
+                CellType.SHELF.value,
+                CellType.DYNAMIC_OBSTACLE.value, 
+                CellType.PICKUP_POINT.value,
+                CellType.DROPOFF_POINT.value
+            ]
         )
-        if swap_collision:
-            final_positions[entity] = current_pos
-            collision_entities.add(entity)
-            reserved_positions[current_pos] = entity
-        else:
-            final_positions[entity] = intended_pos
-            reserved_positions[intended_pos] = entity
+        
+        # Assign the pickup point to the grid
+        self.grid_points[new_pickup_pos] = CellType.PICKUP_POINT.value
+        self.refresh_pickup_points()
+        return new_pickup_pos
 
-    # Ensure every entity has a final position.
-    for entity in all_entities:
-        if entity not in final_positions:
-            final_positions[entity] = current_positions[entity]
+    def remove_pickup_point(self, pos):
+        """
+        Remove a pickup point from the grid
+        """
+        if pos in self.pickup_points:
+            self.grid_points[pos] = CellType.EMPTY.value
+            self.refresh_pickup_points()
+
+    def _check_oscillation(self, agent: AgentID) -> bool:
+        """
+        Return True if the last OSCILLATION_THRESHOLD+1 positions
+        of `agent` strictly alternate between two cells.
+        """
+        history = self.agent_position_histories.get(agent)
+        if history is None or len(history) < OSCILLATION_THRESHOLD + 1:
+            return False
+
+        seq = list(history)
+        # must involve exactly two distinct cells
+        if len(set(seq)) != 2:
+            return False
+
+        # check that seq[i] == seq[i+2] for all valid i
+        for i in range(len(seq) - 2):
+            if seq[i] != seq[i+2]:
+                return False
+
+        return True
     
-    return final_positions, collision_entities, reserved_positions
+    def _check_cycle(self, agent: AgentID) -> bool:
+        """
+        Detect if the agent has looped through OSCILLATION_THRESHOLD distinct cells
+        and returned to the start (i.e. a fixed-length cycle of length OSCILLATION_THRESHOLD).
+        """
+        history = self.agent_position_histories.get(agent)
+        # need at least OSCILLATION_THRESHOLD+1 positions to see a full cycle
+        if history is None or len(history) < OSCILLATION_THRESHOLD + 1:
+            return False
 
-# Wrapper for the environment
-def env(grid_size=(20, 20), human_grid_size=(20, 20), n_agents=2, n_humans=1, num_shelves=30, 
-        num_pickup_points=3, num_dropoff_points=2, render_mode=None):
-    env = WarehouseEnv(grid_size=grid_size, n_agents=n_agents, n_humans=n_humans, human_grid_size=human_grid_size, num_shelves=num_shelves, 
-                        num_pickup_points=num_pickup_points, num_dropoff_points=num_dropoff_points, render_mode=render_mode)
-    # env = wrappers.CaptureStdoutWrapper(env)
-    return env
+        seq = list(history)
+        # 1) it must start and end at the same cell
+        if seq[0] != seq[-1]:
+            return False
+        # 2) all of the intermediate positions must be distinct
+        if len(set(seq[:-1])) != len(seq) - 1:
+            return False
+
+        return True
+    
+#
+# Frame stacking wrapper and factory for WarehouseEnv
+#
+
+class WarehouseFrameStack(ParallelEnv):
+    """
+    Wrapper that stacks the last n_frames observations per agent.
+    """
+    def __init__(self, env: WarehouseEnv):
+        super().__init__()
+        self.env = env
+        self.n_frames = env.n_frames
+        # Initialize deques for each agent
+        self.frames = {
+            agent: deque(maxlen=self.n_frames)
+            for agent in self.env.possible_agents
+        }
+
+    def reset(self, **kwargs):
+        # Reset the base environment
+        obs, info = self.env.reset(**kwargs)
+        # Fill each deque with the initial observation n_frames times
+        for agent, agent_obs in obs.items():
+            self.frames[agent].clear()
+            for _ in range(self.n_frames):
+                self.frames[agent].append(agent_obs.copy())
+        # Return stacked observations
+        stacked = {
+            agent: np.concatenate(list(self.frames[agent]), axis=0)
+            for agent in obs
+        }
+        return stacked, info
+
+    def step(self, actions):
+        # Step the base environment
+        obs, rewards, info = self.env.step(actions)
+        # Append new obs and build stacked observations
+        stacked = {}
+        for agent, agent_obs in obs.items():
+            self.frames[agent].append(agent_obs.copy())
+            stacked[agent] = np.concatenate(list(self.frames[agent]), axis=0)
+        return stacked, rewards, info
+
+    def observation_space(self, agent) -> spaces.Space:
+        """
+        Return the stacked observation space: 10 channels per frame times n_frames.
+        """
+        # Base env produces 10 channels per observation
+        H, W = self.env.observation_size
+        channels = 10 * self.n_frames
+        return spaces.Box(
+            low=0.0,
+            high=1.0,
+            shape=(channels, H, W),
+            dtype=np.float32
+        )
+
+    def action_space(self, agent):
+        # Pass through the base action_space
+        return self.env.action_space(agent)
+
+    def __getattr__(self, name):
+        """
+        Delegate any missing attributes to the base WarehouseEnv
+        """
+        return getattr(self.env, name)
+
+
+def make_env(grid_size=(20,20), human_grid_size=(20,20), n_agents=2, n_humans=1,
+             num_shelves=30, num_pickup_points=2, num_dropoff_points=2,
+             observation_size=(5,5), render_mode=None, use_frame_stack=True,
+             n_frames=8, seed=None):
+    """
+    Factory to create a WarehouseEnv with optional frame stacking.
+    """
+    base = WarehouseEnv(
+        grid_size=grid_size,
+        human_grid_size=human_grid_size,
+        n_agents=n_agents,
+        n_humans=n_humans,
+        num_shelves=num_shelves,
+        num_pickup_points=num_pickup_points,
+        num_dropoff_points=num_dropoff_points,
+        observation_size=observation_size,
+        render_mode=render_mode,
+        seed=seed
+    )
+    # Attach frame stack parameters to base env
+    base.n_frames = n_frames
+    if use_frame_stack:
+        return WarehouseFrameStack(base)
+    return base

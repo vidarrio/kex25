@@ -1,6 +1,6 @@
-from .grid import WarehouseEnv, env
+from .grid import WarehouseEnv
 
 __all__ = [
     "WarehouseEnv", 
-    "env",
+    
 ]

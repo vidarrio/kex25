@@ -1,0 +1,11 @@
+{
+    "reward_table": {
+        "step_penalty": -1.0,
+        "correct_direction_reward": 0.1,
+        "collision_penalty": -2.0,
+        "wrong_pickup_penalty": -2.0,
+        "wrong_dropoff_penalty": -2.0,
+        "oscillation_penalty": -2.0,
+        "task_reward": 20.0
+    }
+}
