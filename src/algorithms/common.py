@@ -34,13 +34,13 @@ def determine_process_count(n_jobs):
             gpu_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)  # Convert to GB
 
             if gpu_mem < 4:
-                n_jobs = 3
+                n_jobs = 4
             elif gpu_mem < 8:
-                n_jobs = 5
-            elif gpu_mem < 16:
                 n_jobs = 8
+            elif gpu_mem < 16:
+                n_jobs = 16
             else:
-                n_jobs = 10
+                n_jobs = 16
         else:
             # Use CPU count if no GPU available
             n_jobs = max(1, min(16, os.cpu_count() - 2))

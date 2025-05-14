@@ -294,3 +294,4 @@ class PopArtLayer(nn.Module):
         self.linear.weight.data.mul_(ratio)
         self.linear.bias.data.mul_(ratio)
         self.linear.bias.data.add_(self.old_mu - self.mu * ratio)
+

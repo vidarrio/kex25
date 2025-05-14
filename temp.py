@@ -1,8 +1,14 @@
-from collections import deque
 import heapq
+import numpy as np
+import time
 import random
 
-from .common import DEBUG_ALL, DEBUG_INFO, DEBUG_VERBOSE, DEBUG_CRITICAL, DEBUG_SPECIFIC
+DEBUG_NONE = 0
+DEBUG_CRITICAL = 1
+DEBUG_INFO = 2
+DEBUG_VERBOSE = 3
+DEBUG_ALL = 4
+DEBUG_SPECIFIC = 5
 
 class AStarAgent:
     """
@@ -65,14 +71,8 @@ class AStarAgent:
         # Get global state for planning
         global_state, additional_info = self.env.get_global_state()
 
-        # Extract obstacle map from the global state (channel 1 is shelves)
-        # First reshape global_state back to its multi-channel grid form
-        channels = 8  # Based on your current implementation
-        height, width = self.env.grid_size
-        reshaped_state = global_state.reshape(channels, height, width)
-        
-        # Extract obstacle map (shelves)
-        obstacle_map = reshaped_state[1].copy()  # Channel 1 is shelves
+        # Extract obstacle map (1 = obstacle, 0 = free space)
+        obstacle_map = global_state[1].copy()
 
         # Debug print obstacle map shape
         self.debug(DEBUG_VERBOSE, f"Obstacle map shape: {obstacle_map.shape}, Grid size: {self.env.grid_size}")
@@ -82,7 +82,7 @@ class AStarAgent:
         reservations = {}
 
         # Debug
-        self.debug(DEBUG_INFO, "\n===== Planning Paths =====")
+        self.debug(DEBUG_CRITICAL, "\n===== Planning Paths =====")
 
         # Get planning priority order
         priority_order = self.get_priority_order()
@@ -396,79 +396,79 @@ class AStarAgent:
     
     def detect_and_handle_local_conflicts(self, observations):
         """
-        Use local observations to detect and handle conflicts with:
-        1. Other agents (collisions)
-        2. Static obstacles (shelves)
-        3. Dynamic obstacles (humans)
+        Use local observations to detect and handle:
+        1. Dynamic obstacles (humans)
+        2. Other agents (collisions)
+        3. Static obstacles (shelves)
 
         Returns:
-            modified (bool): True if any paths were modified
+            modified (boold): True if any paths were modified
         """
 
-        # return False # Disable local conflict handling for now
         modified = False
 
         for agent, observation in observations.items():
-            # Skip if agent has no path or is at the end of its path
+            # If agent has no path or is at the end of its path, skip
             if agent not in self.paths or self.path_indices[agent] >= len(self.paths[agent]):
                 continue
 
-            # Get current position and next planned position
+            # Get current position and planned next position
             current_pos = self.env.agent_positions[agent]
             next_idx = self.path_indices[agent]
 
-            # Track if a conflict was detected
+            # Track if this agent encountered a conflict this iteration
             conflict_detected = False
 
-            # Get next position and action from the path
+            # Get the next position and action from the path
             if next_idx < len(self.paths[agent]):
                 next_r, next_c, action = self.paths[agent][next_idx]
 
-                # We only handle movement actions (0-3)
+                # Only check movement actions (0-3)
                 if action in [0, 1, 2, 3]:
                     # Convert global planned position to local observation coordinates
-                    local_r = next_r - current_pos[0] + 2 # observation is centered around the agent
+                    local_r = next_r - current_pos[0] + 2 # +2 because observations are centered around the agent
                     local_c = next_c - current_pos[1] + 2
-                    
-                    # Check if coordinates are within observation bounds
-                    if 0 <= local_r < 5 and 0 <= local_c < 5:
-                        # Check all obstacle channels
 
+                    # Ensure coordinates are within local observation
+                    if 0 <= local_r < 5 and 0 <= local_c < 5:
+                        
+                        # Check all relevant obstacle channels
+                        
                         # Channel 1: other agents
                         other_agent = observation[1][local_r, local_c] == 1
-
-                        # Channel 2: static obstacles (shelves and boundaries)
+                        
+                        # Channel 2: static obstacles
                         static_obstacle = observation[2][local_r, local_c] == 1
 
-                        # Channel 3: dynamic obstacles (humans)
+                        # Channel 3: dynamic obstacles
                         dynamic_obstacle = observation[3][local_r, local_c] == 1
-                        
+
                         if other_agent or static_obstacle or dynamic_obstacle:
                             # Conflict detected
                             conflict_detected = True
                             obstacle_type = "robot" if other_agent else "shelf" if static_obstacle else "human"
                             self.debug(DEBUG_INFO, f"Agent {agent} detected {obstacle_type} at {next_r, next_c}")
-
+                            
                             # If a conflict is detected, modify the path
                             alternative_action = self._find_local_alternative(agent, observation, action)
 
                             if alternative_action is not None and alternative_action != 6:
-                                # Apply alternative movement
+                                # Apply the alternative movement action
                                 alt_delta = self.action_to_delta[alternative_action]
                                 dr, dc = alt_delta
                                 alt_r, alt_c = current_pos[0] + dr, current_pos[1] + dc
 
-                                # Update path with alternative action
+                                # Update the path with the alternative action
                                 self.paths[agent][next_idx] = (alt_r, alt_c, alternative_action)
                                 self.debug(DEBUG_INFO, f"Agent {agent} modified path to alternative action {alternative_action}")
                                 modified = True
                             else:
-                                # No alternative found, must wait
-                                self.paths[agent].insert(next_idx, (current_pos[0], current_pos[1], 6))
-                                self.debug(DEBUG_INFO, f"Agent {agent} has no alternative to avoid {obstacle_type}, waiting")
+                                # If no alternative action is found, wait
+                                self.paths[agent].insert(next_idx, (current_pos[0], current_pos[1], 6))  # Wait action
+                                self.debug(DEBUG_INFO, f"Agent {agent} has no alternative, waiting")
                                 modified = True
 
-                                # Track consecutive waits at this location
+                                # Track consecutive waits at this position
                                 if not hasattr(self, "position_wait_counts"):
                                     self.position_wait_counts = {a: {} for a in self.env.agents}
 
@@ -478,19 +478,19 @@ class AStarAgent:
 
                                 self.position_wait_counts[agent][pos_key] += 1
 
-                                # If waited too long, trigger replanning
+                                # If waited too long in the same position, trigger replanning
                                 if self.position_wait_counts[agent][pos_key] >= self.local_deadlock_threshold:
-                                    self.debug(DEBUG_INFO, f"Agent {agent} waited too long at {pos_key}, triggering replanning")
+                                    self.debug(DEBUG_CRITICAL, f"Agent {agent} has waited too long at {current_pos}, triggering replanning")
                                     self.need_replanning[agent] = True
                                     self.position_wait_counts[agent][pos_key] = 0
+
                         else:
                             # Clear wait count if no conflict
                             if hasattr(self, "position_wait_counts") and agent in self.position_wait_counts:
                                 pos_key = (current_pos[0], current_pos[1])
                                 if pos_key in self.position_wait_counts[agent]:
                                     self.position_wait_counts[agent][pos_key] = 0
-                    
-
+            
 
             # If agent had conflict or is already in an oscillation pattern, check for oscillation
             if conflict_detected or len(self.position_history[agent]) >= 2:
@@ -502,61 +502,18 @@ class AStarAgent:
                 if len(self.position_history[agent]) > self.oscillation_detection_threshold:
                     self.position_history[agent].pop(0)
 
-                # Check for oscillation pattern
-                if len(self.position_history[agent]) >= 4: # need at least 4 positions to detect oscillation of length 2
+                # Check for oscillation patterns
+                if len(self.position_history[agent]) >= 4: #  Need at least 4 positions to detect oscillation of length 2
                     # Check for ABAB pattern
                     pattern_length = 2
                     if self._detect_oscillation(self.position_history[agent], pattern_length):
-                        self.debug(DEBUG_INFO, f"Agent {agent} detected oscillation pattern, triggering replanning")
+                        self.debug(DEBUG_CRITICAL, f"Agent {agent} detected oscillation pattern, triggering replanning")
                         self.need_replanning[agent] = True
-                        self.position_history[agent] = []
+                        self.position_history[agent] = [] # Reset history after detecting oscillation
                         modified = True
-                        
+
         return modified
-
-    def _handle_conflict(self, agent, observation, action, current_pos, next_idx, obstacle_type):
-        """
-        Helper method to handle conflict resolution for different obstacle types
-        """
-        # Find an alternative action
-        alternative_action = self._find_local_alternative(agent, observation, action)
-        
-        if alternative_action is not None and alternative_action != 6:
-            # Apply alternative movement
-            alt_dr, alt_dc = self.action_to_delta[alternative_action]
-            alt_r, alt_c = current_pos[0] + alt_dr, current_pos[1] + alt_dc
-            
-            # Update path with alternative action
-            self.paths[agent][next_idx] = (alt_r, alt_c, alternative_action)
-            self.debug(DEBUG_INFO, f"Agent {agent} rerouted around {obstacle_type} obstacle with action {alternative_action}")
-            
-            # Try to reconnect to original path
-            self._attempt_path_reconnection(agent, alt_r, alt_c, next_idx)
-            
-            return True
-        else:
-            # No alternative found, must wait
-            self.paths[agent].insert(next_idx, (current_pos[0], current_pos[1], 6))
-            self.debug(DEBUG_INFO, f"Agent {agent} has no alternative to avoid {obstacle_type} obstacle, waiting")
-            
-            # Handle waiting counters
-            pos_key = (current_pos[0], current_pos[1])
-            if not hasattr(self, "position_wait_counts"):
-                self.position_wait_counts = {a: {} for a in self.env.agents}
-            
-            if pos_key not in self.position_wait_counts[agent]:
-                self.position_wait_counts[agent][pos_key] = 0
-                
-            self.position_wait_counts[agent][pos_key] += 1
-            
-            # Trigger replanning if agent has waited too long in the same position
-            if self.position_wait_counts[agent][pos_key] >= self.local_deadlock_threshold:
-                self.debug(DEBUG_INFO, f"Agent {agent} waited too long at {pos_key}, triggering replanning")
-                self.need_replanning[agent] = True
-                self.position_wait_counts[agent][pos_key] = 0
-            
-            return True
-
+    
     def _detect_oscillation(self, history, pattern_length):
         """
         Detect oscillation patterns in the position history.
@@ -749,9 +706,6 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
     # Initialize the A* agent
     a_star_agent = AStarAgent(env)
 
-    # Set debug level
-    a_star_agent.debug_level = debug_level
-
     # Reset the environment
     observations, _ = env.reset()
 
@@ -783,7 +737,7 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
 
         # Check if any pickup/dropoff actions were performed
         if a_star_agent.handle_post_action_state(actions):
-            a_star_agent.debug(DEBUG_INFO, "Replanning after pickup/dropoff...")
+            a_star_agent.debug(DEBUG_CRITICAL, "Replanning after pickup/dropoff...")
             a_star_agent.plan_all_paths()
         
         # Print positions vs goals
@@ -797,7 +751,7 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
             # Check if agent has reached goal
             if pos == goal:
                 if (not carrying and goal in env.pickup_points) or (carrying and goal in env.dropoff_points):
-                    a_star_agent.debug(DEBUG_INFO, f"{agent} has reached its goal!")
+                    a_star_agent.debug(DEBUG_CRITICAL, f"{agent} has reached its goal!")
         
         # Render the environment
         env.render()
@@ -807,27 +761,25 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
         a_star_agent.debug(DEBUG_INFO, f"Completed tasks: {env.completed_tasks}")
         
         # Slow down simulation
-        #time.sleep(0.3)
+        # time.sleep(0.1)
         
         # Check for replanning
         replan = any(a_star_agent.need_replanning.values())
         if replan:
-            a_star_agent.debug(DEBUG_INFO, "\nReplanning paths...")
+            a_star_agent.debug(DEBUG_CRITICAL, "\nReplanning paths...")
             a_star_agent.plan_all_paths()
             
         # Break if all agents are done
         if terminations["__all__"]:
             break
-
+    
     # Print total delievered tasks
     total_delivered = sum(env.completed_tasks.values())
-    a_star_agent.debug(DEBUG_INFO, f"\nTotal delivered tasks: {total_delivered}")
+    a_star_agent.debug(DEBUG_SPECIFIC, f"\nTotal delivered tasks: {total_delivered}")
     # Print total scores
     total_score = sum(cumulative_rewards.values())
-    a_star_agent.debug(DEBUG_INFO, f"Total scores: {total_score}")
+    a_star_agent.debug(DEBUG_SPECIFIC, f"Total scores: {total_score}")
             
     # Close the environment
     env.close()
-
-    # Return total completed tasks
     return total_delivered

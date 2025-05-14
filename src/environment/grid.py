@@ -117,15 +117,8 @@ class WarehouseEnv(ParallelEnv):
         # Place shelves in a warehouse-like layout (aisles)
         self._place_shelves()
 
-        # Place pickup points (e.g. packing stations)
-        self.pickup_points = self._place_random_points(self.num_pickup_points, [1, 2])
-        for pos in self.pickup_points:
-            self.grid[pos] = 4
-
         # Place dropoff points (e.g. shipping area)
-        self.dropoff_points = self._place_random_points(self.num_dropoff_points, [1, 2, 4])
-        for pos in self.dropoff_points:
-            self.grid[pos] = 5
+        self.dropoff_points = self._place_dropoff_points()
 
         # Initialize agents at random positions
         self.agent_positions = {}
@@ -138,10 +131,16 @@ class WarehouseEnv(ParallelEnv):
             pos = get_random_empty_position(grid=self.grid, grid_size=self.grid_size)
             self.agent_positions[agent] = pos
             self.grid[pos] = 1
-
-            # Assign initial goal (pickup point)
-            self._assign_new_goal(agent)
             
+        # Place one pickup point for each agent
+        self.pickup_points = self._place_random_points(self.n_agents, avoid_values=[1, 2, 3, 4, 5])
+        for pos in self.pickup_points:
+            self.grid[pos] = 4
+
+        # Assign each agent a unique pickup point
+        for agent, pos in zip(self.agents, self.pickup_points):
+            self.agent_goals[agent] = pos
+
          # Initialize humans at random positions
         self.human_positions = {}
         self.human_goals = {}
@@ -948,6 +947,39 @@ class WarehouseEnv(ParallelEnv):
         }
 
         return flat_state, additional_info
+    
+    def _place_dropoff_points(self):
+        """
+        Deterministic placement of dropoff points (corners and edges)
+        """
+
+        # Corners of the grid
+        corners = [
+            (0, 0), # Top-left corner
+            (0, self.grid_size[1] - 1), # Top-right corner
+            (self.grid_size[0] - 1, 0), # Bottom-left corner
+            (self.grid_size[0] - 1, self.grid_size[1] - 1) # Bottom-right corner
+        ]
+
+        # Middle of each edge
+        middle_edges = [
+            (0, self.grid_size[1] // 2), # Top edge
+            (self.grid_size[0] - 1, self.grid_size[1] // 2), # Bottom edge
+            (self.grid_size[0] // 2, 0), # Left edge
+            (self.grid_size[0] // 2, self.grid_size[1] - 1) # Right edge
+        ]
+
+        # Combine corners and middle edges
+        all_dropoff_points = corners + middle_edges
+
+        # Set dropoff points list
+        dropoff_points = all_dropoff_points[:self.num_dropoff_points]
+
+        # Set dropoff points in the grid
+        for pos in dropoff_points:
+            self.grid[pos] = 5  # Mark dropoff points in the grid
+
+        return dropoff_points
 
     def _place_shelves(self):
         """
@@ -1123,13 +1155,19 @@ class WarehouseEnv(ParallelEnv):
 
                     # Clear position history to avoid revisit penalty
                     self.position_history[agent] = []
-                    
-                    # Assign new goal
+
+                    # Record item type
                     pickup_idx = self.pickup_points.index(current_pos)
                     self.agent_item_types[agent] = pickup_idx % len(self.dropoff_points)
-                    dropoff_idx = self.agent_item_types[agent]
+
+                    # Remove pickup point from list of available points
+                    self.pickup_points.remove(current_pos)
+
+                    # Assign new goal (random dropoff point)
+                    dropoff_idx = random.randint(0, len(self.dropoff_points) - 1)
+                    self.agent_item_types[agent] = dropoff_idx
                     self.agent_goals[agent] = self.dropoff_points[dropoff_idx]
-                    
+
                     # Record this new goal for task_start tracking
                     if not hasattr(self, 'last_goals'):
                         self.last_goals = {}
@@ -1151,8 +1189,11 @@ class WarehouseEnv(ParallelEnv):
                         self.last_goals = {}
                     self.last_goals[agent] = self.agent_goals[agent]
                     
-                    # Assign new goal
-                    self._assign_new_goal(agent)
+                    # Assign new goal (new random pickup point)
+                    new_pickup_point = get_random_empty_position(grid=self.grid, grid_size=self.grid_size)
+                    self.pickup_points.append(new_pickup_point)
+                    self.agent_goals[agent] = new_pickup_point
+                    self.agent_item_types[agent] = None
 
     def _potential(self, pos, goal):
         # Normalize the potential to a range of [0, 1]

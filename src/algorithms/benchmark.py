@@ -16,10 +16,24 @@ from algorithms.a_star import run_a_star
 from environment import env
 
 # Run a single benchmark episode for A* and RL agents
-def run_benchmark_episode(seed, phase, steps, model_path):
+def run_benchmark_episode(seed, phase, steps, model_path, env_params=None):
 
     # Set up environments with the same seed
-    if phase == 1:
+    if env_params is not None:
+        # use env_params to set up the environment
+        env_a_star = env(grid_size=env_params['grid_size'], human_grid_size=env_params['human_grid_size'], n_agents=env_params['n_agents'],
+                        n_humans=env_params['n_humans'], num_shelves=env_params['num_shelves'], 
+                        num_pickup_points=env_params['num_pickup_points'], num_dropoff_points=env_params['num_dropoff_points'], 
+                        render_mode=None, seed=seed)
+        env_dqn = env(grid_size=env_params['grid_size'], human_grid_size=env_params['human_grid_size'], n_agents=env_params['n_agents'],
+                        n_humans=env_params['n_humans'], num_shelves=env_params['num_shelves'], 
+                        num_pickup_points=env_params['num_pickup_points'], num_dropoff_points=env_params['num_dropoff_points'], 
+                        render_mode=None, seed=seed)
+        
+        # and the n_steps
+        steps = env_params['n_steps']
+
+    elif phase == 1:
         env_a_star = env(grid_size=(5, 5), n_agents=1, n_humans=0, num_shelves=0, 
                     num_pickup_points=1, num_dropoff_points=1, render_mode=None, seed=seed)
         env_dqn = env(grid_size=(5, 5), n_agents=1, n_humans=0, num_shelves=0, 
@@ -30,15 +44,16 @@ def run_benchmark_episode(seed, phase, steps, model_path):
         env_dqn = env(grid_size=(10, 8), n_agents=1, n_humans=0, num_shelves=16, 
                     num_pickup_points=1, num_dropoff_points=1, render_mode=None, seed=seed)
     elif phase == 3:
-        env_a_star = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=6, n_humans=10, num_shelves=2048, 
-                        num_pickup_points=3, num_dropoff_points=2, render_mode=None, seed=seed)
-        env_dqn = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=6, n_humans=10, num_shelves=2048, 
-                        num_pickup_points=3, num_dropoff_points=2, render_mode=None, seed=seed)
-    elif phase == 4:
-        env_a_star = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=10, n_humans=10, num_shelves=2048, 
-                        num_pickup_points=3, num_dropoff_points=2, render_mode=None, seed=seed)
-        env_dqn = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=10, n_humans=10, num_shelves=2048, 
-                        num_pickup_points=3, num_dropoff_points=2, render_mode=None, seed=seed)
+        env_a_star = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=10, n_humans=10, num_shelves=320, 
+                        num_pickup_points=10, num_dropoff_points=10, render_mode=None, seed=seed)
+        env_dqn = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=10, n_humans=10, num_shelves=320, 
+                        num_pickup_points=10, num_dropoff_points=10, render_mode=None, seed=seed)
+    else:
+        env_a_star = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=10, n_humans=10, num_shelves=320, 
+                        num_pickup_points=10, num_dropoff_points=10, render_mode=None, seed=seed)
+        env_dqn = env(grid_size=(34, 32), human_grid_size=(34, 32), n_agents=10, n_humans=10, num_shelves=320, 
+                        num_pickup_points=10, num_dropoff_points=10, render_mode=None, seed=seed)
+
     
     # Reset environments
     env_a_star.reset()
@@ -57,7 +72,7 @@ def run_benchmark_episode(seed, phase, steps, model_path):
     
     return astar_tasks, rl_tasks
 
-def benchmark_environment(env_phase, n_steps=200, debug_level=DEBUG_NONE, model_path=get_model_path(), n_jobs=None, eval_episodes=100):
+def benchmark_environment(env_phase, n_steps=200, debug_level=DEBUG_NONE, model_path=get_model_path(), n_jobs=None, eval_episodes=100, env_params=None):
     """
     Run both A* and RL agents on the same environment to establish performance benchmarks.
     
@@ -88,12 +103,12 @@ def benchmark_environment(env_phase, n_steps=200, debug_level=DEBUG_NONE, model_
             return None
     else:
         print(f"Using model from {model_path}")
-    
+
     # Generate seeds for all episodes
     seeds = [random.randint(0, 10000) for _ in range(eval_episodes)]
 
     # Create a partial function with fixed arguments
-    benchmark_fn = partial(run_benchmark_episode, phase=env_phase, steps=n_steps, model_path=model_path)
+    benchmark_fn = partial(run_benchmark_episode, phase=env_phase, steps=n_steps, model_path=model_path, env_params=env_params)
     
     # Set up multiprocessing pool and run benchmarks in parallel
     print(f"Running {eval_episodes} benchmark episodes in parallel using {n_jobs} processes...")
@@ -148,8 +163,8 @@ def benchmark_environment(env_phase, n_steps=200, debug_level=DEBUG_NONE, model_
     print(f"A* completed tasks: {total_a_star_completed_tasks} (avg: {avg_a_star:.2f} ± {a_star_std:.2f})")
     print(f"RL completed tasks: {total_dqn_completed_tasks} (avg: {avg_dqn:.2f} ± {dqn_std:.2f})")
     print(f"Performance ratio (RL/A*): {performance_ratio:.2f} ± {ratio_std:.2f}")
-    
-    return {
+
+    results = {
         "astar_tasks": total_a_star_completed_tasks,
         "rl_tasks": total_dqn_completed_tasks,
         "performance_ratio": performance_ratio,
@@ -160,8 +175,26 @@ def benchmark_environment(env_phase, n_steps=200, debug_level=DEBUG_NONE, model_
         "ratio_std": ratio_std,
         "astar_tasks_per_episode": a_star_tasks_per_episode,
         "dqn_tasks_per_episode": dqn_tasks_per_episode,
-        "episode_ratios": ratios
+        "episode_ratios": ratios,
     }
+
+    # Calculate per agent averages
+    if env_params is not None:
+        n_agents = env_params['n_agents']
+
+        avg_a_star_per_agent = total_a_star_completed_tasks / (eval_episodes * n_agents) if eval_episodes > 0 else 0
+        avg_dqn_per_agent = total_dqn_completed_tasks / (eval_episodes * n_agents) if eval_episodes > 0 else 0
+
+        # std per agent
+        a_star_std_per_agent = np.std(a_star_tasks_per_episode) / n_agents if a_star_tasks_per_episode else 0
+        dqn_std_per_agent = np.std(dqn_tasks_per_episode) / n_agents if dqn_tasks_per_episode else 0
+
+        results["avg_astar_per_agent"] = avg_a_star_per_agent
+        results["avg_dqn_per_agent"] = avg_dqn_per_agent
+        results["astar_std_per_agent"] = a_star_std_per_agent
+        results["dqn_std_per_agent"] = dqn_std_per_agent
+    
+    return results
 
 def run_q_learning(env, full_model_path, n_steps=1000, debug_level=DEBUG_NONE, sampling_mode='argmax'):
     """
