@@ -346,7 +346,7 @@ class ReplayBuffer:
 class QMIXReplayBuffer:
     """
     Replay buffer for QMIX algorithm that stores individual agent experiences 
-    alongside global state information.
+    alongside global state information. 
     """
 
     def __init__(self, buffer_size, batch_size, use_priority=False, 
