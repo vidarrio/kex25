@@ -961,7 +961,6 @@ def gen_graph(type, model_path, data_path=None):
     if type == "training":
         generate_training_tasks_plot(data_path=model_path)
 
-# Update main function to include benchmark option
 def main():
     parser = argparse.ArgumentParser(description="DQN and A* Benchmarking")
 
@@ -1035,6 +1034,5 @@ def main():
         parser.print_help()
         sys.exit(1)
 
-# Update usage message
 if __name__ == "__main__":
     main()
