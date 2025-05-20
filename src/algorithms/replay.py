@@ -342,3 +342,219 @@ class ReplayBuffer:
         """
 
         return len(self.memory)
+
+class QMIXReplayBuffer:
+    """
+    Replay buffer for QMIX algorithm that stores individual agent experiences 
+    alongside global state information. 
+    """
+
+    def __init__(self, buffer_size, batch_size, use_priority=False, 
+                 alpha=0.6, beta_start=0.4, beta_end=1.0, beta_frames=100000):
+        """
+        Initialize QMIX replay buffer.
+        
+        Args:
+            buffer_size: Maximum size of buffer
+            batch_size: Size of training batch
+            use_priority: Whether to use prioritized experience replay
+            alpha: PER exponent (0 = uniform sampling, higher = more prioritization)
+            beta_start: Starting importance sampling correction
+            beta_end: Final importance sampling correction
+            beta_frames: Number of frames for beta annealing
+        """
+        self.batch_size = batch_size
+        self.buffer_size = buffer_size
+        self.use_priority = use_priority
+        
+        # Define QMIX experience tuple type with global state
+        self.QMIXExperience = namedtuple(
+            'QMIXExperience', 
+            ['agent_states', 'agent_actions', 'agent_rewards', 
+             'agent_next_states', 'agent_dones', 
+             'global_state', 'next_global_state']
+        )
+
+        # Create appropriate storage based on prioritization choice
+        if use_priority:
+            self.tree = SumTree(buffer_size)
+            self.alpha = alpha
+            self.beta = beta_start
+            self.beta_start = beta_start
+            self.beta_end = beta_end
+            self.beta_frames = beta_frames
+            self.frame = 1
+            self.epsilon = 1e-5
+        else:
+            self.memory = deque(maxlen=buffer_size)
+
+    def add(self, agent_states, agent_actions, agent_rewards, 
+            agent_next_states, agent_dones, global_state, next_global_state, error=None):
+        """
+        Add experience to buffer
+        
+        Args:
+            agent_states: States for each agent [num_agents, state_shape]
+            agent_actions: Actions for each agent [num_agents]
+            agent_rewards: Rewards for each agent [num_agents]
+            agent_next_states: Next states for each agent [num_agents, state_shape]
+            agent_dones: Done flags for each agent [num_agents]
+            global_state: Global state representation [global_state_shape]
+            next_global_state: Next global state [global_state_shape]
+            error: TD error for prioritization (optional)
+        """
+        # Create experience tuple
+        experience = self.QMIXExperience(
+            agent_states, agent_actions, agent_rewards, 
+            agent_next_states, agent_dones, 
+            global_state, next_global_state
+        )
+        
+        # Add to appropriate storage
+        if self.use_priority:
+            if error is None:
+                priority = self.tree.max_priority
+            else:
+                priority = (abs(error) + self.epsilon) ** self.alpha
+            
+            self.tree.add(priority, experience)
+            self.frame += 1
+            self.beta = min(self.beta_end, self.beta_start + 
+                           (self.beta_end - self.beta_start) * 
+                           (self.frame / self.beta_frames))
+        else:
+            self.memory.append(experience)
+
+    def sample(self):
+        """
+        Sample a batch of experiences from buffer
+        
+        Returns:
+            Tuple of tensors for QMIX training:
+            - agent_states: [batch_size, num_agents, state_shape]
+            - agent_actions: [batch_size, num_agents]
+            - agent_rewards: [batch_size, num_agents]
+            - agent_next_states: [batch_size, num_agents, state_shape]
+            - agent_dones: [batch_size, num_agents]
+            - global_states: [batch_size, global_state_shape]
+            - next_global_states: [batch_size, global_state_shape]
+            - weights: Importance sampling weights (if using PER)
+            - indices: Sampled indices (if using PER)
+        """
+        if self.use_priority:
+            return self._sample_prioritized()
+        else:
+            return self._sample_uniform()
+
+    def _sample_uniform(self):
+        """Sample uniformly from replay buffer"""
+        if len(self.memory) < self.batch_size:
+            # Return empty tensors if not enough samples
+            return None
+            
+        experiences = random.sample(self.memory, k=self.batch_size)
+        
+        # Extract and batch experience components
+        agent_states = np.stack([e.agent_states for e in experiences])
+        agent_actions = np.stack([e.agent_actions for e in experiences])
+        agent_rewards = np.stack([e.agent_rewards for e in experiences])
+        agent_next_states = np.stack([e.agent_next_states for e in experiences])
+        agent_dones = np.stack([e.agent_dones for e in experiences]).astype(np.float32)
+        global_states = np.stack([e.global_state for e in experiences])
+        next_global_states = np.stack([e.next_global_state for e in experiences])
+        
+        # Transfer to device
+        agent_states = torch.from_numpy(agent_states).float().to(device, non_blocking=True)
+        agent_actions = torch.from_numpy(agent_actions).long().to(device, non_blocking=True)
+        agent_rewards = torch.from_numpy(agent_rewards).float().to(device, non_blocking=True)
+        agent_next_states = torch.from_numpy(agent_next_states).float().to(device, non_blocking=True)
+        agent_dones = torch.from_numpy(agent_dones).float().to(device, non_blocking=True)
+        global_states = torch.from_numpy(global_states).float().to(device, non_blocking=True)
+        next_global_states = torch.from_numpy(next_global_states).float().to(device, non_blocking=True)
+        
+        # For uniform sampling, weights are all 1s and indices are None
+        weights = torch.ones((self.batch_size, 1), device=device)
+        indices = None
+        
+        return (agent_states, agent_actions, agent_rewards, 
+                agent_next_states, agent_dones, 
+                global_states, next_global_states, 
+                weights, indices)
+
+    def _sample_prioritized(self):
+        """Sample based on priorities using SumTree"""
+        if self.tree.n_entries == 0 or self.tree.n_entries < self.batch_size:
+            # Return empty tensors if not enough samples
+            return None
+        
+        # Use vectorized numpy operations for sampling
+        total_priority = self.tree.total_priority()
+        
+        # Create segment boundaries
+        segment_size = total_priority / self.batch_size
+        segment_bounds = np.linspace(0, total_priority, self.batch_size + 1)
+        
+        # Sample from each segment with slight randomness
+        values = np.random.uniform(segment_bounds[:-1], segment_bounds[1:])
+        
+        # Preallocate arrays
+        indices = np.empty(self.batch_size, dtype=np.int32)
+        priorities = np.empty(self.batch_size, dtype=np.float32)
+        batch = []
+        
+        # Get samples based on priority values
+        for i, value in enumerate(values):
+            idx, priority, experience = self.tree.get(value)
+            
+            indices[i] = idx
+            priorities[i] = priority
+            batch.append(experience)
+        
+        # Calculate importance sampling weights
+        probs = priorities / total_priority
+        weights = (probs * self.tree.n_entries) ** (-self.beta)
+        max_weight = ((self.tree.min_priority / total_priority) * self.tree.n_entries) ** (-self.beta)
+        weights = weights / max_weight
+        
+        # Extract experience components
+        agent_states = np.stack([e.agent_states for e in batch])
+        agent_actions = np.stack([e.agent_actions for e in batch])
+        agent_rewards = np.stack([e.agent_rewards for e in batch])
+        agent_next_states = np.stack([e.agent_next_states for e in batch])
+        agent_dones = np.stack([e.agent_dones for e in batch]).astype(np.float32)
+        global_states = np.stack([e.global_state for e in batch])
+        next_global_states = np.stack([e.next_global_state for e in batch])
+        
+        # Transfer to device
+        agent_states = torch.from_numpy(agent_states).float().to(device)
+        agent_actions = torch.from_numpy(agent_actions).long().to(device)
+        agent_rewards = torch.from_numpy(agent_rewards).float().to(device)
+        agent_next_states = torch.from_numpy(agent_next_states).float().to(device)
+        agent_dones = torch.from_numpy(agent_dones).float().to(device)
+        global_states = torch.from_numpy(global_states).float().to(device)
+        next_global_states = torch.from_numpy(next_global_states).float().to(device)
+        weights = torch.from_numpy(weights).float().unsqueeze(1).to(device)
+        
+        return (agent_states, agent_actions, agent_rewards, 
+                agent_next_states, agent_dones, 
+                global_states, next_global_states, 
+                weights, indices)
+
+    def update_priorities(self, indices, errors):
+        """Update priorities for prioritized replay based on TD errors"""
+        if not self.use_priority or indices is None:
+            return
+            
+        # Clip very small errors to avoid numerical instability
+        errors = np.clip(np.abs(errors), self.epsilon, 10.0)
+        priorities = (errors + self.epsilon) ** self.alpha
+        
+        # Update priorities based on TD errors
+        self.tree.batch_update(indices, priorities)
+    
+    def __len__(self):
+        """Return the current size of the buffer."""
+        if self.use_priority:
+            return self.tree.n_entries
+        else:
+            return len(self.memory)

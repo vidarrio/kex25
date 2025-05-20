@@ -1,14 +1,8 @@
 from collections import deque
 import heapq
-import numpy as np
-import time
+import random
 
-DEBUG_NONE = 0
-DEBUG_CRITICAL = 1
-DEBUG_INFO = 2
-DEBUG_VERBOSE = 3
-DEBUG_ALL = 4
-DEBUG_SPECIFIC = 5
+from .common import DEBUG_ALL, DEBUG_INFO, DEBUG_VERBOSE, DEBUG_CRITICAL, DEBUG_SPECIFIC
 
 class AStarAgent:
     """
@@ -71,8 +65,14 @@ class AStarAgent:
         # Get global state for planning
         global_state, additional_info = self.env.get_global_state()
 
-        # Extract obstacle map (1 = obstacle, 0 = free space)
-        obstacle_map = global_state[1].copy()
+        # Extract obstacle map from the global state (channel 1 is shelves)
+        # First reshape global_state back to its multi-channel grid form
+        channels = 8  # Based on your current implementation
+        height, width = self.env.grid_size
+        reshaped_state = global_state.reshape(channels, height, width)
+        
+        # Extract obstacle map (shelves)
+        obstacle_map = reshaped_state[1].copy()  # Channel 1 is shelves
 
         # Debug print obstacle map shape
         self.debug(DEBUG_VERBOSE, f"Obstacle map shape: {obstacle_map.shape}, Grid size: {self.env.grid_size}")
@@ -333,7 +333,8 @@ class AStarAgent:
                             # This wait path is better
                             came_from[wait_node] = (current, 6)  # Wait action
                             g_score[wait_node] = tentative_g_score
-                            f_score[wait_node] = tentative_g_score + self._heuristic((current_r, current_c), goal)
+                            # Add tiny noise to break symmetry
+                            f_score[wait_node] = tentative_g_score + self._heuristic((current_r, current_c), goal) + random.random() * 1e-3
 
                             heapq.heappush(open_set, (f_score[wait_node], counter, wait_node))
                             counter += 1
@@ -364,7 +365,8 @@ class AStarAgent:
                     # Record this path
                     came_from[next_node] = (current, action)
                     g_score[next_node] = tentative_g_score
-                    f_score[next_node] = tentative_g_score + self._heuristic((next_r, next_c), goal)
+                    # Add tiny noise to break symmetry
+                    f_score[next_node] = tentative_g_score + self._heuristic((next_r, next_c), goal) + random.random() * 1e-3
 
                     heapq.heappush(open_set, (f_score[next_node], counter, next_node))
                     counter += 1
@@ -381,7 +383,8 @@ class AStarAgent:
                     # This wait path is better
                     came_from[wait_node] = (current, 6)  # Wait action
                     g_score[wait_node] = tentative_g_score
-                    f_score[wait_node] = tentative_g_score + self._heuristic((current_r, current_c), goal)
+                    # Add tiny noise to break symmetry
+                    f_score[wait_node] = tentative_g_score + self._heuristic((current_r, current_c), goal) + random.random() * 1e-3
                     
                     heapq.heappush(open_set, (f_score[wait_node], counter, wait_node))
                     counter += 1
@@ -389,128 +392,6 @@ class AStarAgent:
         # If we reach here, no path was found
         if explored_nodes >= max_explored:
             self.debug(DEBUG_INFO, f"  Path search exceeded max exploration limit for {agent}")
-        return None
-    
-    def _attempt_path_reconnection(self, agent, current_r, current_c, modified_idx):
-        """
-        Try to reconnect from the modified position back to the original path.
-        
-        Args:
-            agent: Agent ID
-            current_r, current_c: Current position after local adjustment
-            modified_idx: Index of the modified step in the path
-        
-        Returns:
-            True if reconnection was successful, False otherwise
-        """
-        self.debug(DEBUG_INFO, f"Attempting path reconnection for agent {agent}")
-        
-        # If we're at the end of the path, no need to reconnect
-        if modified_idx >= len(self.paths[agent]) - 1:
-            return True
-        
-        # Get the original global path starting from a few steps ahead
-        # Try to reconnect to a point 2-4 steps ahead to avoid the obstacle
-        max_look_ahead = min(4, len(self.paths[agent]) - modified_idx - 1)
-        if max_look_ahead <= 0:
-            return False
-            
-        # Find reconnection candidates from the original path
-        reconnect_candidates = []
-        for i in range(1, max_look_ahead + 1):
-            target_idx = modified_idx + i
-            if target_idx < len(self.paths[agent]):
-                target_r, target_c, _ = self.paths[agent][target_idx]
-                # Calculate Manhattan distance to this point
-                distance = abs(current_r - target_r) + abs(current_c - target_c)
-                reconnect_candidates.append((target_idx, (target_r, target_c), distance))
-        
-        if not reconnect_candidates:
-            return False
-            
-        # Sort candidates by distance (closest first)
-        reconnect_candidates.sort(key=lambda x: x[2])
-        
-        # Get obstacle map for planning
-        global_state, _ = self.env.get_global_state()
-        obstacle_map = global_state[1].copy()
-        
-        # Try to connect to each candidate
-        for target_idx, (target_r, target_c), _ in reconnect_candidates:
-            # Plan a mini-path from current position to the reconnection point
-            mini_path = self._mini_path_plan(
-                (current_r, current_c), 
-                (target_r, target_c), 
-                obstacle_map
-            )
-            
-            if mini_path:
-                # Found a reconnection path!
-                self.debug(DEBUG_INFO, f"Found reconnection path of length {len(mini_path)} to original path at index {target_idx}")
-                
-                # Replace the path segment between modified_idx and target_idx
-                new_path = self.paths[agent][:modified_idx]  # Keep path up to modification
-                new_path.extend(mini_path)  # Add reconnection segment
-                new_path.extend(self.paths[agent][target_idx+1:])  # Add remainder of original path
-                
-                self.paths[agent] = new_path
-                return True
-        
-        # Could not reconnect to any point
-        self.debug(DEBUG_INFO, f"Failed to reconnect path for agent {agent}")
-        return False
-    
-    def _mini_path_plan(self, start, goal, obstacle_map, max_depth=10):
-        """
-        Simple breadth-first search for short path planning.
-        More efficient than A* for very short paths.
-        
-        Args:
-            start: (row, col) Start position
-            goal: (row, col) Goal position
-            obstacle_map: Binary map where 1 indicates obstacle
-            max_depth: Maximum search depth
-        
-        Returns:
-            List of (row, col, action) tuples or None if no path found
-        """
-        # Use BFS for quick local planning
-        queue = deque([(start, [])])  # (position, path)
-        visited = {start}
-        
-        while queue:
-            (r, c), path = queue.popleft()
-            
-            # Check if we've reached the goal
-            if (r, c) == goal:
-                return path
-                
-            # Stop if path is too long
-            if len(path) >= max_depth:
-                continue
-                
-            # Check all four directions
-            for action, (dr, dc) in enumerate([(0, -1), (1, 0), (0, 1), (-1, 0)]):
-                nr, nc = r + dr, c + dc
-                
-                # Skip if out of bounds
-                if nr < 0 or nr >= self.env.grid_size[0] or nc < 0 or nc >= self.env.grid_size[1]:
-                    continue
-                    
-                # Skip if obstacle
-                if obstacle_map[nr, nc] == 1:
-                    continue
-                    
-                # Skip if already visited
-                if (nr, nc) in visited:
-                    continue
-                    
-                # Add to queue
-                new_path = path + [(nr, nc, action)]
-                queue.append(((nr, nc), new_path))
-                visited.add((nr, nc))
-        
-        # No path found
         return None
     
     def detect_and_handle_local_conflicts(self, observations):
@@ -524,7 +405,7 @@ class AStarAgent:
             modified (bool): True if any paths were modified
         """
 
-        return False # Disable local conflict handling for now
+        # return False # Disable local conflict handling for now
         modified = False
 
         for agent, observation in observations.items():
@@ -532,186 +413,106 @@ class AStarAgent:
             if agent not in self.paths or self.path_indices[agent] >= len(self.paths[agent]):
                 continue
 
+            # Get current position and next planned position
             current_pos = self.env.agent_positions[agent]
             next_idx = self.path_indices[agent]
+
+            # Track if a conflict was detected
             conflict_detected = False
 
-            # Get next planned action
+            # Get next position and action from the path
             if next_idx < len(self.paths[agent]):
                 next_r, next_c, action = self.paths[agent][next_idx]
 
                 # We only handle movement actions (0-3)
                 if action in [0, 1, 2, 3]:
-                    # Calculate expected next position based on current position
-                    dr, dc = self.action_to_delta[action]
-                    expected_next_r, expected_next_c = current_pos[0] + dr, current_pos[1] + dc
-                    
-                    # Check if path is out of sync with current position
-                    if (expected_next_r, expected_next_c) != (next_r, next_c):
-                        self.debug(DEBUG_INFO, f"Agent {agent} path out of sync. Expected: {(expected_next_r, expected_next_c)}, Path: {(next_r, next_c)}")
-                        self.need_replanning[agent] = True
-                        modified = True
-                        continue
-
-                    # Calculate local coordinates - agent is at (2,2) in observation
-                    local_r, local_c = 2 + dr, 2 + dc
+                    # Convert global planned position to local observation coordinates
+                    local_r = next_r - current_pos[0] + 2 # observation is centered around the agent
+                    local_c = next_c - current_pos[1] + 2
                     
                     # Check if coordinates are within observation bounds
                     if 0 <= local_r < 5 and 0 <= local_c < 5:
-                        # Get obstacle information from observation channels
-                        other_agent = observation[1][local_r, local_c] == 1  # Channel 1: other agents
-                        static_obstacle = observation[2][local_r, local_c] == 1  # Channel 2: static obstacles
-                        dynamic_obstacle = observation[3][local_r, local_c] == 1  # Channel 3: dynamic obstacles
+                        # Check all obstacle channels
+
+                        # Channel 1: other agents
+                        other_agent = observation[1][local_r, local_c] == 1
+
+                        # Channel 2: static obstacles (shelves and boundaries)
+                        static_obstacle = observation[2][local_r, local_c] == 1
+
+                        # Channel 3: dynamic obstacles (humans)
+                        dynamic_obstacle = observation[3][local_r, local_c] == 1
                         
-                        # Check actual grid value at intended position
-                        grid_value = self.env.grid[next_r, next_c]
-                        
-                        # Debug output
-                        self.debug(DEBUG_VERBOSE, f"Agent {agent} current pos: {current_pos}, local obs: dynamic_obstacle={dynamic_obstacle}, static_obstacle={static_obstacle}, at {local_r},{local_c}, grid {next_r, next_c} value: {grid_value}")
-                        
-                        # Skip collision detection for pickup/dropoff points that are goals
-                        is_pickup = (next_r, next_c) in self.env.pickup_points
-                        is_dropoff = (next_r, next_c) in self.env.dropoff_points
-                        is_goal = (next_r, next_c) == self.env.agent_goals[agent]
-                        
-                        # Handle various obstacle scenarios
-                        if other_agent or static_obstacle:
-                            # Handle non-human obstacles normally
-                            if not (is_pickup or is_dropoff):
-                                conflict_detected = True
-                                self._handle_conflict(agent, observation, action, current_pos, next_idx, "static")
-                                modified = True
-                        elif dynamic_obstacle:
-                            # Special handling for humans
+                        if other_agent or static_obstacle or dynamic_obstacle:
+                            # Conflict detected
                             conflict_detected = True
-                            
-                            # Check if this human is directly blocking a goal point
-                            is_blocking_goal = False
-                            goal_pos = self.env.agent_goals[agent]
-                            
-                            # Create next_pos tuple from next_r and next_c
-                            next_pos = (next_r, next_c)
-                            
-                            # Check if the human is between agent and goal using Manhattan distance
-                            if self._heuristic(current_pos, next_pos) < self._heuristic(current_pos, goal_pos) and \
-                               self._heuristic(next_pos, goal_pos) < self._heuristic(current_pos, goal_pos):
-                                is_blocking_goal = True
-                                
-                            # If human is blocking goal, we need to be more aggressive about finding a path around
-                            if is_blocking_goal:
-                                self.debug(DEBUG_INFO, f"Agent {agent} detected human blocking path to goal")
-                                
-                                # Try to find a path around the human
-                                alternative_action = self._find_path_around_human(agent, observation, action)
-                                
-                                if alternative_action is not None and alternative_action != 6:
-                                    # Apply alternative movement
-                                    alt_dr, alt_dc = self.action_to_delta[alternative_action]
-                                    alt_r, alt_c = current_pos[0] + alt_dr, current_pos[1] + alt_dc
-                                    
-                                    # Update path with alternative action
-                                    self.paths[agent][next_idx] = (alt_r, alt_c, alternative_action)
-                                    self.debug(DEBUG_INFO, f"Agent {agent} rerouted around human with action {alternative_action}")
-                                    
-                                    # Try to reconnect to original path
-                                    reconnection_success = self._attempt_path_reconnection(agent, alt_r, alt_c, next_idx)
-                                    
-                                    if not reconnection_success:
-                                        # If we can't reconnect, force replanning after a short wait
-                                        self.debug(DEBUG_INFO, f"Path reconnection failed for agent {agent}, will replan after a few steps")
-                                        self.human_avoidance_replanning[agent] = 3  # Replan after 3 steps
-                                    
-                                    modified = True
-                                else:
-                                    # If no alternative path found, trigger immediate replanning
-                                    self.debug(DEBUG_INFO, f"Agent {agent} cannot find path around human, triggering replanning")
-                                    self.need_replanning[agent] = True
-                                    modified = True
-                            else:
-                                # Human is not blocking a goal, handle normally with waiting
-                                self._handle_conflict(agent, observation, action, current_pos, next_idx, "dynamic")
+                            obstacle_type = "robot" if other_agent else "shelf" if static_obstacle else "human"
+                            self.debug(DEBUG_INFO, f"Agent {agent} detected {obstacle_type} at {next_r, next_c}")
+
+                            # If a conflict is detected, modify the path
+                            alternative_action = self._find_local_alternative(agent, observation, action)
+
+                            if alternative_action is not None and alternative_action != 6:
+                                # Apply alternative movement
+                                alt_delta = self.action_to_delta[alternative_action]
+                                dr, dc = alt_delta
+                                alt_r, alt_c = current_pos[0] + dr, current_pos[1] + dc
+
+                                # Update path with alternative action
+                                self.paths[agent][next_idx] = (alt_r, alt_c, alternative_action)
+                                self.debug(DEBUG_INFO, f"Agent {agent} modified path to alternative action {alternative_action}")
                                 modified = True
-                    
-        # Check for agents that need replanning after human avoidance
-        if hasattr(self, 'human_avoidance_replanning'):
-            for agent in list(self.human_avoidance_replanning.keys()):
-                self.human_avoidance_replanning[agent] -= 1
-                if self.human_avoidance_replanning[agent] <= 0:
-                    self.debug(DEBUG_INFO, f"Agent {agent} triggering delayed replanning after human avoidance")
-                    self.need_replanning[agent] = True
-                    del self.human_avoidance_replanning[agent]
+                            else:
+                                # No alternative found, must wait
+                                self.paths[agent].insert(next_idx, (current_pos[0], current_pos[1], 6))
+                                self.debug(DEBUG_INFO, f"Agent {agent} has no alternative to avoid {obstacle_type}, waiting")
+                                modified = True
 
-        return modified
+                                # Track consecutive waits at this location
+                                if not hasattr(self, "position_wait_counts"):
+                                    self.position_wait_counts = {a: {} for a in self.env.agents}
 
-    def _find_path_around_human(self, agent, observation, blocked_action):
-        """
-        Find a path around a human obstacle by considering multiple steps ahead.
-        This is a more thorough search than _find_local_alternative.
-        
-        Returns: Best alternative action or None if no path found
-        """
-        current_pos = self.env.agent_positions[agent]
-        goal = self.env.agent_goals[agent]
-        
-        # We'll try to find a 2-step path around the obstacle
-        best_score = float('-inf')
-        best_action = None
-        
-        # Try each direction for the first step
-        for action1 in range(4):
-            if action1 == blocked_action:
-                continue
-            
-            # Get delta for first action
-            dr1, dc1 = self.action_to_delta[action1]
-            local_r1, local_c1 = 2 + dr1, 2 + dc1
-            
-            # Check if first step is valid (within bounds and no obstacles)
-            if 0 <= local_r1 < 5 and 0 <= local_c1 < 5:
-                if (observation[1][local_r1, local_c1] == 0 and  # No agents
-                    observation[2][local_r1, local_c1] == 0 and  # No shelves
-                    observation[3][local_r1, local_c1] == 0):    # No humans
+                                pos_key = (current_pos[0], current_pos[1])
+                                if pos_key not in self.position_wait_counts[agent]:
+                                    self.position_wait_counts[agent][pos_key] = 0
+
+                                self.position_wait_counts[agent][pos_key] += 1
+
+                                # If waited too long, trigger replanning
+                                if self.position_wait_counts[agent][pos_key] >= self.local_deadlock_threshold:
+                                    self.debug(DEBUG_INFO, f"Agent {agent} waited too long at {pos_key}, triggering replanning")
+                                    self.need_replanning[agent] = True
+                                    self.position_wait_counts[agent][pos_key] = 0
+                        else:
+                            # Clear wait count if no conflict
+                            if hasattr(self, "position_wait_counts") and agent in self.position_wait_counts:
+                                pos_key = (current_pos[0], current_pos[1])
+                                if pos_key in self.position_wait_counts[agent]:
+                                    self.position_wait_counts[agent][pos_key] = 0
                     
-                    # Calculate position after first step
-                    pos1_r = current_pos[0] + dr1
-                    pos1_c = current_pos[1] + dc1
-                    pos1 = (pos1_r, pos1_c)
-                    
-                    # Try each direction for the second step
-                    for action2 in range(4):
-                        dr2, dc2 = self.action_to_delta[action2]
-                        pos2_r = pos1_r + dr2
-                        pos2_c = pos1_c + dc2
-                        pos2 = (pos2_r, pos2_c)
+
+
+            # If agent had conflict or is already in an oscillation pattern, check for oscillation
+            if conflict_detected or len(self.position_history[agent]) >= 2:
+                # Record the current position for oscillation detection
+                current_pos = self.env.agent_positions[agent]
+                self.position_history[agent].append(current_pos)
+
+                # Limit history size
+                if len(self.position_history[agent]) > self.oscillation_detection_threshold:
+                    self.position_history[agent].pop(0)
+
+                # Check for oscillation pattern
+                if len(self.position_history[agent]) >= 4: # need at least 4 positions to detect oscillation of length 2
+                    # Check for ABAB pattern
+                    pattern_length = 2
+                    if self._detect_oscillation(self.position_history[agent], pattern_length):
+                        self.debug(DEBUG_INFO, f"Agent {agent} detected oscillation pattern, triggering replanning")
+                        self.need_replanning[agent] = True
+                        self.position_history[agent] = []
+                        modified = True
                         
-                        # We don't have observation data for pos2, use grid instead
-                        if 0 <= pos2_r < self.env.grid.shape[0] and 0 <= pos2_c < self.env.grid.shape[1]:
-                            # Check grid value at pos2
-                            grid_val = self.env.grid[pos2_r, pos2_c]
-                            
-                            # If pos2 is empty or a pickup/dropoff point
-                            if grid_val == 0 or grid_val == 4 or grid_val == 5:
-                                # Calculate how much closer we get to the goal
-                                initial_dist = self._heuristic(current_pos, goal)
-                                final_dist = self._heuristic(pos2, goal)
-                                score = initial_dist - final_dist
-                                
-                                # Bonus for getting around the human
-                                if final_dist < initial_dist:
-                                    score += 2.0
-                                    
-                                # If this is better than our current best, update it
-                                if score > best_score:
-                                    best_score = score
-                                    best_action = action1
-        
-        # If we found a promising action, return it
-        if best_action is not None:
-            self.debug(DEBUG_INFO, f"Agent {agent} found path around human with score {best_score}")
-            return best_action
-            
-        # Fall back to simpler alternative finding if no 2-step path works
-        return self._find_local_alternative(agent, observation, blocked_action)
+        return modified
 
     def _handle_conflict(self, agent, observation, action, current_pos, next_idx, obstacle_type):
         """
@@ -789,6 +590,7 @@ class AStarAgent:
         Returns:
             Alternative action or wait if no alternative is found
         """
+
         # Get agent's current position and goal
         current_pos = self.env.agent_positions[agent]
         goal = self.env.agent_goals[agent]
@@ -801,7 +603,7 @@ class AStarAgent:
 
         for action in range(4):  # Only movement actions (0-3)
             if action == blocked_action:
-                continue  # Skip the blocked action
+                continue # Skip the blocked action
 
             # Get the delta for this action
             delta = self.action_to_delta[action]
@@ -813,43 +615,28 @@ class AStarAgent:
 
             # Check if this position is within bounds
             if 0 <= local_r < 5 and 0 <= local_c < 5:
-                # Check if this position is free (no obstacles of any kind)
-                if (observation[1][local_r, local_c] == 0 and  # No other agents
-                    observation[2][local_r, local_c] == 0 and  # No shelves
-                    observation[3][local_r, local_c] == 0):    # No humans
+                # Check if this position is free (no agents, shelves, or humans)
+                if (observation[1][local_r, local_c] == 0 and
+                    observation[2][local_r, local_c] == 0 and
+                    observation[3][local_r, local_c] == 0):
                     
                     # Calculate new position and distance to goal
                     new_r = current_pos[0] + dr
                     new_c = current_pos[1] + dc
-                    new_pos = (new_r, new_c)
-                    
-                    # Skip pickup/dropoff points that belong to other agents
-                    if ((new_pos in self.env.pickup_points or new_pos in self.env.dropoff_points) and
-                        new_pos != self.env.agent_goals[agent]):
-                        continue
-                    
-                    new_distance = self._heuristic(new_pos, goal)
+                    new_distance = self._heuristic((new_r, new_c), goal)
 
-                    # Calculate score: lower distance is better
+                    # Calculate score: lower distance is better, negative score means we're moving away from the goal
                     score = current_distance - new_distance
-                    
-                    # Bonus for actions that move around blocked direction
-                    # This encourages moving around obstacles rather than backtracking
-                    if (blocked_action in [0, 2] and action in [1, 3]) or \
-                       (blocked_action in [1, 3] and action in [0, 2]):
-                        score += 0.5  # Small bonus for perpendicular movement
-                    
+
                     possible_actions.append((action, score))
 
         # If there are possible actions
         if possible_actions:
             # Sort by score (higher is better)
             possible_actions.sort(key=lambda x: x[1], reverse=True)
-            
+
             # Return the best action
-            best_action = possible_actions[0][0]
-            self.debug(DEBUG_INFO, f"Agent {agent} found alternative action {best_action} with score {possible_actions[0][1]}")
-            return best_action
+            return possible_actions[0][0]
 
         # If no alternatives found, return wait action
         self.debug(DEBUG_INFO, f"Agent {agent} has no alternatives, waiting")
@@ -859,22 +646,16 @@ class AStarAgent:
         """
         Handle the state after executing pickup / dropoff actions.
         """
+
         result = False
 
         for agent, action in actions.items():
             # After executing a dropoff action, force immediate replanning
             if action == 5: # Dropoff action
-                self.debug(DEBUG_INFO, f"Agent {agent} executed dropoff action, forcing replanning")
+                self.debug(DEBUG_CRITICAL, f"Agent {agent} executed dropoff action, forcing replanning")
                 
                 # Reset consecutive waits to prevent false deadlock detection
                 self.consecutive_waits[agent] = 0
-
-                # Reset position history to prevent false oscillation detection
-                self.position_history[agent] = []
-                
-                # Reset position-specific wait counts too
-                if hasattr(self, "position_wait_counts") and agent in self.position_wait_counts:
-                    self.position_wait_counts[agent] = {}
 
                 # Mark this agent for replanning
                 self.need_replanning[agent] = True
@@ -882,13 +663,10 @@ class AStarAgent:
 
             # After executing a pickup action, force immediate replanning
             elif action == 4: # Pickup action
-                self.debug(DEBUG_INFO, f"Agent {agent} executed pickup action, forcing replanning")
+                self.debug(DEBUG_CRITICAL, f"Agent {agent} executed pickup action, forcing replanning")
                 
                 # Reset consecutive waits to prevent false deadlock detection
                 self.consecutive_waits[agent] = 0
-
-                # Reset position history to prevent false oscillation detection
-                self.position_history[agent] = []
 
                 # Mark this agent for replanning
                 self.need_replanning[agent] = True
@@ -1022,7 +800,7 @@ def run_a_star(env, n_steps=1000, debug_level=DEBUG_INFO):
                     a_star_agent.debug(DEBUG_INFO, f"{agent} has reached its goal!")
         
         # Render the environment
-        # env.render()
+        env.render()
         
         # Print info
         a_star_agent.debug(DEBUG_INFO, f"Rewards: {rewards}")
