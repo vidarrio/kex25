@@ -1,5 +1,8 @@
 # kex25
 
+## Thesis
+[The Paper](thesis.pdf)
+
 ## Overview
 This repository contains the code for our bachelor thesis at KTH, which focuses on robot planning in a warehouse environment. The project involves setting up a simulated grid environment, implementing an A* algorithm, and implementing a reinforcement learning algorithm. The goal is to compare the efficiency and performance of these two algorithms.
 
